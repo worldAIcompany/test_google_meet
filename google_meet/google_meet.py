@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Скрипт для создания Google Meet с полностью открытым доступом
-Автор: Claude 3.7 Sonnet
-Дата: 2024-04-14
-"""
-
 import os
 import sys
 import datetime
@@ -20,17 +14,13 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # Путь к токену и файлу с учетными данными
-TOKEN_PATH = 'token.pickle'
-CREDENTIALS_FILE = 'credentials.json'
+TOKEN_PATH = 'google_meet/token.pickle'
+CREDENTIALS_FILE = 'google_meet/credentials.json'
 
 # Область действия для Google Calendar API
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
 def get_credentials():
-    """
-    Получение учетных данных Google API.
-    Создает токен, если его нет, или обновляет существующий.
-    """
     creds = None
     
     # Проверяем существует ли токен
@@ -39,7 +29,7 @@ def get_credentials():
             with open(TOKEN_PATH, 'rb') as token:
                 creds = pickle.load(token)
         except Exception as e:
-            print(f"Ошибка при чтении токена: {e}")
+            pass
     
     # Если нет действительных учетных данных, получаем новые
     if not creds or not creds.valid:
@@ -47,41 +37,27 @@ def get_credentials():
             try:
                 creds.refresh(Request())
             except Exception as e:
-                print(f"Ошибка при обновлении токена: {e}")
                 creds = None
         
         # Если токен не удалось обновить, создаем новый
         if not creds:
             # Проверяем наличие файла с учетными данными
             if not os.path.exists(CREDENTIALS_FILE):
-                print(f"\033[91mФайл {CREDENTIALS_FILE} не найден!\033[0m")
-                print("\033[93mДля создания файла credentials.json выполните следующие шаги:\033[0m")
-                print("1. Перейдите на https://console.cloud.google.com/")
-                print("2. Создайте проект и включите Google Calendar API")
-                print("3. Создайте учетные данные OAuth и скачайте JSON-файл")
-                print("4. Переименуйте файл в credentials.json и поместите его в текущую директорию")
-                sys.exit(1)
+                return None
             
             try:
                 flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
                 creds = flow.run_local_server(port=0)
             except Exception as e:
-                print(f"\033[91mОшибка при создании токена: {e}\033[0m")
-                sys.exit(1)
+                return None
             
             # Сохраняем токен
             with open(TOKEN_PATH, 'wb') as token:
                 pickle.dump(creds, token)
-            
-            print("\033[92mТокен авторизации успешно создан и сохранен\033[0m")
     
     return creds
 
 def create_fully_accessible_meet():
-    """
-    Создает Google Meet с полностью открытым доступом
-    через Google Calendar API
-    """
     # Получаем учетные данные
     creds = get_credentials()
     
@@ -89,8 +65,7 @@ def create_fully_accessible_meet():
     try:
         service = build('calendar', 'v3', credentials=creds)
     except Exception as e:
-        print(f"\033[91mОшибка при создании сервиса: {e}\033[0m")
-        sys.exit(1)
+        return None
     
     # Случайное имя для встречи
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
@@ -137,7 +112,6 @@ def create_fully_accessible_meet():
     
     # Добавляем настройку для открытого доступа
     try:
-        print("\033[93mСоздаем встречу с открытым доступом...\033[0m")
         event = service.events().insert(
             calendarId='primary',
             body=event,
@@ -153,36 +127,30 @@ def create_fully_accessible_meet():
                     break
         
         if not meet_link:
-            print("\033[91mНе удалось получить ссылку на встречу\033[0m")
             return None
         
         # Сохраняем ссылку в файл
-        with open('last_meet_link.txt', 'w') as file:
+        with open('google_meet/last_meet_link.txt', 'w') as file:
             file.write(meet_link)
-        
-        print("\033[92mВстреча успешно создана!\033[0m")
-        print(f"\033[92mСсылка на встречу: {meet_link}\033[0m")
-        print("\033[93mРекомендуется зайти в настройки встречи и проверить, что 'Быстрый доступ' включен\033[0m")
         
         return meet_link
     
     except HttpError as error:
-        print(f"\033[91mОшибка при создании встречи: {error}\033[0m")
         return None
 
-if __name__ == "__main__":
-    print("\033[94m====================================================================\033[0m")
-    print("\033[92mСоздание Google Meet с ГАРАНТИРОВАННО ОТКРЫТЫМ ДОСТУПОМ\033[0m")
-    print("\033[94m====================================================================\033[0m")
-    
+def google_meet():
     # Создаем встречу с открытым доступом
     meet_link = create_fully_accessible_meet()
     
     if meet_link:
-        print("\033[92mУспешно создана встреча с открытым доступом\033[0m")
-        print("\033[93mВАЖНО: При входе в созданную встречу убедитесь, что 'Быстрый доступ' включен!\033[0m")
+        return meet_link
     else:
-        print("\033[91mНе удалось создать встречу\033[0m")
+        return None
+
+if __name__ == "__main__":
+    meet_link = google_meet()
+    
+    if not meet_link:
         sys.exit(1)
     
     sys.exit(0) 
