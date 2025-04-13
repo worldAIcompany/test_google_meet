@@ -8,9 +8,13 @@ import time
 import threading
 import schedule
 import pytz
+from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
 from google_meet.google_meet import google_meet
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Enable logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -133,8 +137,16 @@ def process_schedule_add(update: Update, context: CallbackContext) -> int:
             
             save_schedules()
             
-            # Update active schedules
-            setup_schedules(context)
+            # Schedule just this new task instead of rescheduling everything
+            if hasattr(context, 'job_queue') and context.job_queue:
+                create_job_for_schedule(
+                    context.bot,
+                    context.job_queue,
+                    user_id,  # Already an integer
+                    day_of_week,
+                    hours,
+                    minutes
+                )
         
         update.message.reply_text(
             f'Еженедельная отправка добавлена: {day_text} {hours:02d}:{minutes:02d}'
@@ -227,8 +239,16 @@ def process_schedule_delete(update: Update, context: CallbackContext) -> int:
                 scheduled_meets[user_id] = new_schedules
                 save_schedules()
                 
-                # Update active schedules
-                setup_schedules(context)
+                # Remove the specific job instead of rescheduling everything
+                if hasattr(context, 'job_queue') and context.job_queue:
+                    for job in context.job_queue.jobs():
+                        job_context = job.context
+                        if (job_context.get('user_id') == user_id and
+                            job_context.get('day') == day_of_week and
+                            job_context.get('hours') == hours and
+                            job_context.get('minutes') == minutes):
+                            job.schedule_removal()
+                            logger.info(f"Removed job for user {user_id} on {DAYS_DISPLAY[day_of_week]} at {hours:02d}:{minutes:02d}")
         
         if deleted:
             update.message.reply_text(
@@ -265,11 +285,13 @@ def send_meet_link(context: CallbackContext) -> None:
                 chat_id=user_id,
                 text=f'Ваша еженедельная Google Meet встреча ({day_text} {hours:02d}:{minutes:02d}):\n{meet_link}'
             )
+            logger.info(f"Sent meet link to user {user_id} for {day_text} {hours:02d}:{minutes:02d}")
         else:
             context.bot.send_message(
                 chat_id=user_id,
                 text='Не удалось создать ссылку на Google Meet. Пожалуйста, проверьте настройки.'
             )
+            logger.error(f"Failed to create meet link for user {user_id}")
     except Exception as e:
         logger.error(f"Error sending meet link: {e}")
         try:
@@ -277,13 +299,53 @@ def send_meet_link(context: CallbackContext) -> None:
                 chat_id=user_id,
                 text='Произошла ошибка при отправке ссылки на Google Meet.'
             )
-        except:
-            pass
+        except Exception as inner_e:
+            logger.error(f"Failed to send error message: {inner_e}")
 
-def setup_schedules(context: CallbackContext) -> None:
+def create_job_for_schedule(bot, job_queue, user_id, day, hours, minutes):
+    """Create a job for the scheduler."""
+    # We run the job at the specified time on the specified day of the week
+    target_day = day
+    
+    # Calculate days until next occurrence
+    now = datetime.datetime.now(MOSCOW_TZ)
+    current_day = now.weekday()
+    
+    # Days until the next scheduled day (0-6)
+    days_ahead = (target_day - current_day) % 7
+    
+    # If it's the same day but the time has passed, schedule for next week
+    if days_ahead == 0:
+        target_time = now.replace(hour=hours, minute=minutes, second=0, microsecond=0)
+        if now > target_time:
+            days_ahead = 7
+    
+    # Calculate the next run time
+    target_date = now + datetime.timedelta(days=days_ahead)
+    target_time = target_date.replace(hour=hours, minute=minutes, second=0, microsecond=0)
+    
+    job_context = {
+        'user_id': user_id,
+        'day': day,
+        'hours': hours,
+        'minutes': minutes
+    }
+    
+    # Schedule the job with job_queue from telegram.ext
+    job_queue.run_repeating(
+        send_meet_link,
+        interval=datetime.timedelta(days=7),  # Weekly
+        first=target_time.astimezone(pytz.UTC),  # Convert to UTC for the job queue
+        context=job_context
+    )
+    
+    logger.info(f"Scheduled job for user {user_id} on {DAYS_DISPLAY[day]} at {hours:02d}:{minutes:02d}")
+
+def setup_schedules(job_queue, bot) -> None:
     """Setup all schedules for all users."""
-    # Clear all existing schedule jobs
-    schedule.clear()
+    # Clear all existing jobs in job_queue
+    for job in job_queue.jobs():
+        job.schedule_removal()
     
     with schedule_lock:
         load_schedules()
@@ -294,56 +356,15 @@ def setup_schedules(context: CallbackContext) -> None:
                 hours = schedule_item['hours']
                 minutes = schedule_item['minutes']
                 
-                # Get day of week name
-                day_name = list(DAYS_RU.keys())[list(DAYS_RU.values()).index(day)]
-                
-                # Schedule the job
-                job_context = {
-                    'user_id': user_id,
-                    'day': day,
-                    'hours': hours,
-                    'minutes': minutes
-                }
-                
-                # Set up the schedule
-                if day == 0:  # Monday
-                    schedule.every().monday.at(f"{hours:02d}:{minutes:02d}").do(
-                        lambda ctx=context, jctx=job_context: send_meet_link_wrapper(ctx, jctx)
-                    )
-                elif day == 1:  # Tuesday
-                    schedule.every().tuesday.at(f"{hours:02d}:{minutes:02d}").do(
-                        lambda ctx=context, jctx=job_context: send_meet_link_wrapper(ctx, jctx)
-                    )
-                elif day == 2:  # Wednesday
-                    schedule.every().wednesday.at(f"{hours:02d}:{minutes:02d}").do(
-                        lambda ctx=context, jctx=job_context: send_meet_link_wrapper(ctx, jctx)
-                    )
-                elif day == 3:  # Thursday
-                    schedule.every().thursday.at(f"{hours:02d}:{minutes:02d}").do(
-                        lambda ctx=context, jctx=job_context: send_meet_link_wrapper(ctx, jctx)
-                    )
-                elif day == 4:  # Friday
-                    schedule.every().friday.at(f"{hours:02d}:{minutes:02d}").do(
-                        lambda ctx=context, jctx=job_context: send_meet_link_wrapper(ctx, jctx)
-                    )
-                elif day == 5:  # Saturday
-                    schedule.every().saturday.at(f"{hours:02d}:{minutes:02d}").do(
-                        lambda ctx=context, jctx=job_context: send_meet_link_wrapper(ctx, jctx)
-                    )
-                elif day == 6:  # Sunday
-                    schedule.every().sunday.at(f"{hours:02d}:{minutes:02d}").do(
-                        lambda ctx=context, jctx=job_context: send_meet_link_wrapper(ctx, jctx)
-                    )
-
-def send_meet_link_wrapper(context, job_context):
-    """Wrapper for send_meet_link to be used with schedule."""
-    context.job_queue.run_once(send_meet_link, 0, context=job_context)
-
-def run_scheduler():
-    """Run the scheduler in a separate thread."""
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+                # Create a job with the telegram job queue
+                create_job_for_schedule(
+                    bot,
+                    job_queue,
+                    int(user_id),  # Ensure user_id is an integer
+                    day,
+                    hours,
+                    minutes
+                )
 
 def help_command(update: Update, context: CallbackContext) -> None:
     """Send a message when the command /help is issued."""
@@ -375,13 +396,13 @@ def handle_text(update: Update, context: CallbackContext) -> None:
 def main() -> None:
     """Start the bot."""
     # Get bot token from environment variable
-    token = os.environ.get("TELEGRAM_TOKEN")
+    token = os.getenv("TELEGRAM_TOKEN")
     if not token:
-        logger.error("No TELEGRAM_TOKEN found in environment variables")
+        logger.error("No TELEGRAM_TOKEN found in .env file")
         return
     
-    # Create the Updater and pass it your bot's token
-    updater = Updater(token)
+    # Create the Updater and pass it your bot's token with increased timeouts
+    updater = Updater(token, request_kwargs={'read_timeout': 30, 'connect_timeout': 30})
     
     # Get the dispatcher to register handlers
     dispatcher = updater.dispatcher
@@ -417,14 +438,9 @@ def main() -> None:
     dispatcher.add_handler(MessageHandler(Filters.regex('^Посмотреть отправки$'), list_schedules))
     dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
     
-    # Setup schedules
+    # Setup schedules using the job_queue from the updater
     load_schedules()
-    setup_schedules(updater.dispatcher.bot_data)
-    
-    # Start the scheduler thread
-    scheduler_thread = threading.Thread(target=run_scheduler)
-    scheduler_thread.daemon = True
-    scheduler_thread.start()
+    setup_schedules(updater.job_queue, updater.bot)
     
     # Start the Bot
     updater.start_polling()

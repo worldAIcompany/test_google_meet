@@ -44,11 +44,12 @@ pip install -r requirements.txt
 
 ## Запуск
 
-1. Задайте токен Telegram бота в переменной окружения:
-```
-export TELEGRAM_TOKEN=your_telegram_token  # для Linux/Mac
-set TELEGRAM_TOKEN=your_telegram_token     # для Windows
-```
+1. Настройте токен бота в файле `.env`:
+   - Откройте файл `.env` в корне проекта
+   - Замените `your_telegram_token_here` на ваш токен:
+   ```
+   TELEGRAM_TOKEN=your_telegram_token_here
+   ```
 
 2. Запустите бота:
 ```
