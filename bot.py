@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os
+import sys
 import json
 import logging
 import datetime
@@ -8,6 +9,7 @@ import time
 import threading
 import schedule
 import pytz
+import fcntl
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
@@ -19,6 +21,28 @@ load_dotenv()
 # Enable logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Create lock file to prevent multiple instances
+LOCK_FILE = 'bot.lock'
+lock_file_handle = None
+
+def check_single_instance():
+    """Ensure only one instance of the bot is running."""
+    global lock_file_handle
+    
+    try:
+        # Open the lock file
+        lock_file_handle = open(LOCK_FILE, 'w')
+        
+        # Try to acquire an exclusive lock
+        fcntl.flock(lock_file_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        
+        # If we got here, no other instance is running
+        return True
+    except IOError:
+        # Another instance has the lock
+        logger.error("Another instance of the bot is already running!")
+        return False
 
 # Conversation states
 ADD_SCHEDULE, DELETE_SCHEDULE = range(2)
@@ -393,61 +417,91 @@ def handle_text(update: Update, context: CallbackContext) -> None:
             'Используйте кнопки меню или команды /start и /help'
         )
 
+def cleanup():
+    """Clean up resources before exiting."""
+    global lock_file_handle
+    
+    # Release the lock and close the file handle
+    if lock_file_handle:
+        try:
+            fcntl.flock(lock_file_handle, fcntl.LOCK_UN)
+            lock_file_handle.close()
+            # Optionally remove the lock file
+            os.remove(LOCK_FILE)
+        except:
+            pass
+
 def main() -> None:
     """Start the bot."""
-    # Get bot token from environment variable
-    token = os.getenv("TELEGRAM_TOKEN")
-    if not token:
-        logger.error("No TELEGRAM_TOKEN found in .env file")
-        return
+    # Check if another instance is running
+    if not check_single_instance():
+        logger.error("Exiting due to another instance running")
+        sys.exit(1)
     
-    # Create the Updater and pass it your bot's token with increased timeouts
-    updater = Updater(token, request_kwargs={'read_timeout': 30, 'connect_timeout': 30})
-    
-    # Get the dispatcher to register handlers
-    dispatcher = updater.dispatcher
-    
-    # Add conversation handlers
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler('add', add_schedule_command),
-            MessageHandler(Filters.regex('^Добавить еженедельную отправку$'), add_schedule_command)
-        ],
-        states={
-            ADD_SCHEDULE: [MessageHandler(Filters.text & ~Filters.command, process_schedule_add)],
-        },
-        fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
-    )
-    
-    del_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler('delete', delete_schedule_command),
-            MessageHandler(Filters.regex('^Удалить отправку$'), delete_schedule_command)
-        ],
-        states={
-            DELETE_SCHEDULE: [MessageHandler(Filters.text & ~Filters.command, process_schedule_delete)],
-        },
-        fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
-    )
-    
-    # Add handlers
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(CommandHandler("help", help_command))
-    dispatcher.add_handler(conv_handler)
-    dispatcher.add_handler(del_handler)
-    dispatcher.add_handler(MessageHandler(Filters.regex('^Посмотреть отправки$'), list_schedules))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
-    
-    # Setup schedules using the job_queue from the updater
-    load_schedules()
-    setup_schedules(updater.job_queue, updater.bot)
-    
-    # Start the Bot
-    updater.start_polling()
-    logger.info("Bot started")
-    
-    # Run the bot until you press Ctrl-C
-    updater.idle()
+    try:
+        # Get bot token from environment variable
+        token = os.getenv("TELEGRAM_TOKEN")
+        if not token:
+            logger.error("No TELEGRAM_TOKEN found in .env file")
+            return
+        
+        # Create the Updater and pass it your bot's token with increased timeouts
+        updater = Updater(token, request_kwargs={'read_timeout': 30, 'connect_timeout': 30})
+        
+        # Get the dispatcher to register handlers
+        dispatcher = updater.dispatcher
+        
+        # Add conversation handlers
+        conv_handler = ConversationHandler(
+            entry_points=[
+                CommandHandler('add', add_schedule_command),
+                MessageHandler(Filters.regex('^Добавить еженедельную отправку$'), add_schedule_command)
+            ],
+            states={
+                ADD_SCHEDULE: [MessageHandler(Filters.text & ~Filters.command, process_schedule_add)],
+            },
+            fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+        )
+        
+        del_handler = ConversationHandler(
+            entry_points=[
+                CommandHandler('delete', delete_schedule_command),
+                MessageHandler(Filters.regex('^Удалить отправку$'), delete_schedule_command)
+            ],
+            states={
+                DELETE_SCHEDULE: [MessageHandler(Filters.text & ~Filters.command, process_schedule_delete)],
+            },
+            fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+        )
+        
+        # Add handlers
+        dispatcher.add_handler(CommandHandler("start", start))
+        dispatcher.add_handler(CommandHandler("help", help_command))
+        dispatcher.add_handler(conv_handler)
+        dispatcher.add_handler(del_handler)
+        dispatcher.add_handler(MessageHandler(Filters.regex('^Посмотреть отправки$'), list_schedules))
+        dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
+        
+        # Setup schedules using the job_queue from the updater
+        load_schedules()
+        setup_schedules(updater.job_queue, updater.bot)
+        
+        # Start the Bot
+        updater.start_polling()
+        logger.info("Bot started")
+        
+        # Run the bot until you press Ctrl-C
+        updater.idle()
+    finally:
+        # Clean up when the bot stops
+        cleanup()
 
 if __name__ == '__main__':
-    main() 
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+        cleanup()
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        cleanup() 
