@@ -106,8 +106,10 @@ def setup_commands(updater):
         BotCommand("start", "Начать работу с ботом"),
         BotCommand("help", "Показать справку"),
         BotCommand("add", "Добавить еженедельную отправку"),
+        BotCommand("addtime", "Добавить отправку в формате: /addtime день ЧЧ:ММ"),
         BotCommand("list", "Посмотреть отправки"),
         BotCommand("delete", "Удалить отправку"),
+        BotCommand("deletetime", "Удалить отправку в формате: /deletetime день ЧЧ:ММ"),
         BotCommand("meet", "Мгновенная встреча")
     ]
     updater.bot.set_my_commands(commands)
@@ -486,17 +488,29 @@ def setup_schedules(job_queue, bot) -> None:
 
 def help_command(update: Update, context: CallbackContext) -> None:
     """Send a message when the command /help is issued."""
-    update.message.reply_text(
-        'Команды бота:\n'
-        '/start - начать работу с ботом\n'
-        '/help - показать эту справку\n'
-        '/add - добавить еженедельную отправку\n'
-        '/list - просмотреть все отправки\n'
-        '/delete - удалить отправку\n'
-        '/meet - получить мгновенную ссылку на встречу\n\n'
-        'Бот поддерживает работу как в личных чатах, так и в группах.\n'
-        'В группах управлять расписанием могут только администраторы.'
-    )
+    is_group = update.effective_chat.type in ['group', 'supergroup']
+    
+    if is_group:
+        update.message.reply_text(
+            'Команды бота в группах:\n'
+            '/start - начать работу с ботом\n'
+            '/help - показать эту справку\n'
+            '/addtime день ЧЧ:ММ - добавить еженедельную отправку (например: /addtime среда 12:46)\n'
+            '/list - просмотреть все отправки\n'
+            '/deletetime день ЧЧ:ММ - удалить отправку (например: /deletetime среда 12:46)\n'
+            '/meet - получить мгновенную ссылку на встречу\n\n'
+            'В группах управлять расписанием могут только администраторы.'
+        )
+    else:
+        update.message.reply_text(
+            'Команды бота:\n'
+            '/start - начать работу с ботом\n'
+            '/help - показать эту справку\n'
+            '/add - добавить еженедельную отправку\n'
+            '/list - просмотреть все отправки\n'
+            '/delete - удалить отправку\n'
+            '/meet - получить мгновенную ссылку на встречу'
+        )
 
 def send_instant_meet_link(update: Update, context: CallbackContext) -> None:
     """Send an instant Google Meet link to the user."""
@@ -521,6 +535,221 @@ def send_instant_meet_link(update: Update, context: CallbackContext) -> None:
         logger.error(f"Error sending instant meet link: {e}")
         update.message.reply_text('Произошла ошибка при отправке ссылки на Google Meet.')
 
+def add_schedule_direct(update: Update, context: CallbackContext) -> None:
+    """Directly add a schedule without conversation (for groups)."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Проверяем, является ли отправитель администратором группы, если это групповой чат
+    if update.effective_chat.type in ['group', 'supergroup']:
+        try:
+            member = context.bot.get_chat_member(chat_id, user_id)
+            if member.status not in ['creator', 'administrator']:
+                update.message.reply_text('Только администраторы группы могут управлять расписанием.')
+                return
+        except Exception as e:
+            logger.error(f"Error checking admin status: {e}")
+            update.message.reply_text('Произошла ошибка при проверке прав администратора.')
+            return
+    
+    # Получаем аргументы
+    text = update.message.text.strip()
+    
+    # Удаляем имя бота, если команда вызвана с @botname
+    if '@' in text:
+        text = text.split('@', 1)[0].strip()
+    
+    # Удаляем команду из текста
+    parts = text.split(' ', 1)
+    if len(parts) < 2:
+        update.message.reply_text(
+            'Пожалуйста, укажите день и время в формате: /addtime день ЧЧ:ММ\n'
+            'Например: /addtime среда 12:46'
+        )
+        return
+    
+    # Разбираем аргументы (день и время)
+    args = parts[1].strip().lower().split()
+    
+    if len(args) < 2:
+        update.message.reply_text(
+            'Пожалуйста, укажите день и время в формате: /addtime день ЧЧ:ММ\n'
+            'Например: /addtime среда 12:46'
+        )
+        return
+    
+    day_text = args[0]
+    time_text = args[1]
+    
+    logger.info(f"Processing direct add: day={day_text}, time={time_text} from user {user_id} in chat {chat_id}")
+    
+    try:
+        if day_text not in DAYS_RU:
+            update.message.reply_text(
+                f'Некорректный день недели. Используйте: {", ".join(DAYS_RU.keys())}'
+            )
+            return
+        
+        day_of_week = DAYS_RU[day_text]
+        
+        try:
+            hours, minutes = map(int, time_text.split(':'))
+            if not (0 <= hours < 24 and 0 <= minutes < 60):
+                raise ValueError("Invalid time")
+        except:
+            update.message.reply_text('Некорректный формат времени. Используйте ЧЧ:ММ, например 12:46')
+            return
+        
+        with schedule_lock:
+            load_schedules()
+            
+            if chat_id not in scheduled_meets:
+                scheduled_meets[chat_id] = []
+            
+            # Check if this schedule already exists
+            for schedule_item in scheduled_meets[chat_id]:
+                if schedule_item['day'] == day_of_week and schedule_item['hours'] == hours and schedule_item['minutes'] == minutes:
+                    update.message.reply_text('Такое расписание уже существует!')
+                    return
+            
+            # Add new schedule
+            scheduled_meets[chat_id].append({
+                'day': day_of_week,
+                'hours': hours,
+                'minutes': minutes
+            })
+            
+            save_schedules()
+            
+            # Schedule just this new task instead of rescheduling everything
+            if hasattr(context, 'job_queue') and context.job_queue:
+                create_job_for_schedule(
+                    context.bot,
+                    context.job_queue,
+                    chat_id,
+                    day_of_week,
+                    hours,
+                    minutes
+                )
+        
+        update.message.reply_text(
+            f'Еженедельная отправка добавлена: {day_text} {hours:02d}:{minutes:02d}'
+        )
+    except Exception as e:
+        logger.error(f"Error in direct add schedule: {e}")
+        update.message.reply_text(
+            'Произошла ошибка. Убедитесь, что формат "/addtime день ЧЧ:ММ" правильный.\n'
+            'Например: /addtime среда 12:46'
+        )
+
+def delete_schedule_direct(update: Update, context: CallbackContext) -> None:
+    """Directly delete a schedule without conversation (for groups)."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Проверяем, является ли отправитель администратором группы, если это групповой чат
+    if update.effective_chat.type in ['group', 'supergroup']:
+        try:
+            member = context.bot.get_chat_member(chat_id, user_id)
+            if member.status not in ['creator', 'administrator']:
+                update.message.reply_text('Только администраторы группы могут управлять расписанием.')
+                return
+        except Exception as e:
+            logger.error(f"Error checking admin status: {e}")
+            update.message.reply_text('Произошла ошибка при проверке прав администратора.')
+            return
+    
+    # Получаем аргументы
+    text = update.message.text.strip()
+    
+    # Удаляем имя бота, если команда вызвана с @botname
+    if '@' in text:
+        text = text.split('@', 1)[0].strip()
+    
+    # Удаляем команду из текста
+    parts = text.split(' ', 1)
+    if len(parts) < 2:
+        update.message.reply_text(
+            'Пожалуйста, укажите день и время в формате: /deletetime день ЧЧ:ММ\n'
+            'Например: /deletetime среда 12:46'
+        )
+        return
+    
+    # Разбираем аргументы (день и время)
+    args = parts[1].strip().lower().split()
+    
+    if len(args) < 2:
+        update.message.reply_text(
+            'Пожалуйста, укажите день и время в формате: /deletetime день ЧЧ:ММ\n'
+            'Например: /deletetime среда 12:46'
+        )
+        return
+    
+    day_text = args[0]
+    time_text = args[1]
+    
+    logger.info(f"Processing direct delete: day={day_text}, time={time_text} from user {user_id} in chat {chat_id}")
+    
+    try:
+        if day_text not in DAYS_RU:
+            update.message.reply_text(
+                f'Некорректный день недели. Используйте: {", ".join(DAYS_RU.keys())}'
+            )
+            return
+        
+        day_of_week = DAYS_RU[day_text]
+        
+        try:
+            hours, minutes = map(int, time_text.split(':'))
+            if not (0 <= hours < 24 and 0 <= minutes < 60):
+                raise ValueError("Invalid time")
+        except:
+            update.message.reply_text('Некорректный формат времени. Используйте ЧЧ:ММ, например 12:46')
+            return
+        
+        deleted = False
+        with schedule_lock:
+            load_schedules()
+            
+            if chat_id in scheduled_meets:
+                new_schedules = []
+                for schedule_item in scheduled_meets[chat_id]:
+                    if (schedule_item['day'] == day_of_week and 
+                        schedule_item['hours'] == hours and 
+                        schedule_item['minutes'] == minutes):
+                        deleted = True
+                    else:
+                        new_schedules.append(schedule_item)
+                
+                scheduled_meets[chat_id] = new_schedules
+                save_schedules()
+                
+                # Remove the specific job instead of rescheduling everything
+                if hasattr(context, 'job_queue') and context.job_queue:
+                    for job in context.job_queue.jobs():
+                        job_context = job.context
+                        if (job_context.get('user_id') == chat_id and
+                            job_context.get('day') == day_of_week and
+                            job_context.get('hours') == hours and
+                            job_context.get('minutes') == minutes):
+                            job.schedule_removal()
+                            logger.info(f"Removed job for chat {chat_id} on {DAYS_DISPLAY[day_of_week]} at {hours:02d}:{minutes:02d}")
+        
+        if deleted:
+            update.message.reply_text(
+                f'Еженедельная отправка удалена: {day_text} {hours:02d}:{minutes:02d}'
+            )
+        else:
+            update.message.reply_text(
+                f'Отправка {day_text} {hours:02d}:{minutes:02d} не найдена'
+            )
+    except Exception as e:
+        logger.error(f"Error in direct delete schedule: {e}")
+        update.message.reply_text(
+            'Произошла ошибка. Убедитесь, что формат "/deletetime день ЧЧ:ММ" правильный.\n'
+            'Например: /deletetime среда 12:46'
+        )
+
 def handle_text(update: Update, context: CallbackContext) -> None:
     """Handle text messages."""
     if not update.message:
@@ -531,7 +760,8 @@ def handle_text(update: Update, context: CallbackContext) -> None:
     user_id = update.effective_user.id
     state_key = f"{chat_id}_{user_id}"
     
-    logger.info(f"Received text: '{text}' from user {user_id} in chat {chat_id}")
+    logger.info(f"Received text: '{text}' from user {user_id} in chat {chat_id}, state_key: {state_key}")
+    logger.info(f"All active states: {user_states}")
     
     # Проверяем, если пользователь находится в состоянии диалога
     if state_key in user_states:
@@ -541,6 +771,19 @@ def handle_text(update: Update, context: CallbackContext) -> None:
             return process_schedule_add(update, context)
         elif state == DELETE_SCHEDULE:
             return process_schedule_delete(update, context)
+    
+    # Обработка команд с @username в группах
+    if '@' in text:
+        cmd_parts = text.split('@', 1)
+        command = cmd_parts[0]
+        if command == '/add':
+            return add_schedule_command(update, context)
+        elif command == '/list':
+            return list_schedules(update, context)
+        elif command == '/delete':
+            return delete_schedule_command(update, context)
+        elif command == '/meet':
+            return send_instant_meet_link(update, context)
     
     # Если это не состояние диалога, обрабатываем команды
     if text.startswith('/add') or text == 'Добавить еженедельную отправку':
@@ -604,6 +847,10 @@ def main() -> None:
         dispatcher.add_handler(CommandHandler("list", list_schedules))
         dispatcher.add_handler(CommandHandler("add", add_schedule_command))
         dispatcher.add_handler(CommandHandler("delete", delete_schedule_command))
+        
+        # Прямые команды для групп
+        dispatcher.add_handler(CommandHandler("addtime", add_schedule_direct))
+        dispatcher.add_handler(CommandHandler("deletetime", delete_schedule_direct))
         
         # Обработка текстовых сообщений
         dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
