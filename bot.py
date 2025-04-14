@@ -11,7 +11,7 @@ import schedule
 import pytz
 import fcntl
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, BotCommand
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
 from google_meet.google_meet import google_meet
 
@@ -82,6 +82,9 @@ DAYS_DISPLAY = {
     6: 'воскресенье'
 }
 
+# Используем dict для отслеживания состояний в разных чатах
+user_states = {}
+
 def load_schedules():
     """Load schedules from file."""
     global scheduled_meets
@@ -97,25 +100,64 @@ def save_schedules():
     with open(SCHEDULE_FILE, 'w') as f:
         json.dump(scheduled_meets, f)
 
+def setup_commands(updater):
+    """Set up bot commands in menu"""
+    commands = [
+        BotCommand("start", "Начать работу с ботом"),
+        BotCommand("help", "Показать справку"),
+        BotCommand("add", "Добавить еженедельную отправку"),
+        BotCommand("list", "Посмотреть отправки"),
+        BotCommand("delete", "Удалить отправку"),
+        BotCommand("meet", "Мгновенная встреча")
+    ]
+    updater.bot.set_my_commands(commands)
+    logger.info("Bot commands have been set up")
+
 def start(update: Update, context: CallbackContext) -> None:
     """Send a message when the command /start is issued."""
     user = update.effective_user
+    chat_id = update.effective_chat.id
+    
     keyboard = [
-        ['Добавить еженедельную отправку'],
-        ['Посмотреть отправки'],
-        ['Удалить отправку'],
-        ['Мгновенная встреча']
+        ['/add', '/list'],
+        ['/delete', '/meet'],
+        ['/help']
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     update.message.reply_text(
         f'Привет, {user.first_name}! Я бот для создания и отправки ссылок на Google Meet.\n\n'
-        'Используйте кнопки ниже для управления автоматическими отправками.',
+        'Используйте команды ниже для управления автоматическими отправками.',
         reply_markup=reply_markup
     )
+    
+    # Register chat_id if it's a group
+    if update.effective_chat.type in ['group', 'supergroup']:
+        with schedule_lock:
+            load_schedules()
+            group_name = update.effective_chat.title
+            logger.info(f"Bot added to group: {group_name} ({chat_id})")
 
 def add_schedule_command(update: Update, context: CallbackContext) -> int:
     """Start the process of adding a new schedule."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Сохраняем состояние пользователя/чата
+    user_states[f"{chat_id}_{user_id}"] = ADD_SCHEDULE
+    
+    # Проверяем, является ли отправитель администратором группы, если это групповой чат
+    if update.effective_chat.type in ['group', 'supergroup']:
+        try:
+            member = context.bot.get_chat_member(chat_id, user_id)
+            if member.status not in ['creator', 'administrator']:
+                update.message.reply_text('Только администраторы группы могут управлять расписанием.')
+                return ConversationHandler.END
+        except Exception as e:
+            logger.error(f"Error checking admin status: {e}")
+            update.message.reply_text('Произошла ошибка при проверке прав администратора.')
+            return ConversationHandler.END
+    
     update.message.reply_text(
         'Укажите день недели и время по Москве в формате "день ЧЧ:ММ"\n'
         'Например: среда 12:46'
@@ -124,7 +166,14 @@ def add_schedule_command(update: Update, context: CallbackContext) -> int:
 
 def process_schedule_add(update: Update, context: CallbackContext) -> int:
     """Process a schedule request."""
+    chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    state_key = f"{chat_id}_{user_id}"
+    
+    # Проверяем состояние пользователя
+    if state_key not in user_states or user_states[state_key] != ADD_SCHEDULE:
+        return ConversationHandler.END
+    
     text = update.message.text.strip().lower()
     
     try:
@@ -149,17 +198,20 @@ def process_schedule_add(update: Update, context: CallbackContext) -> int:
         with schedule_lock:
             load_schedules()
             
-            if user_id not in scheduled_meets:
-                scheduled_meets[user_id] = []
+            if chat_id not in scheduled_meets:
+                scheduled_meets[chat_id] = []
             
             # Check if this schedule already exists
-            for schedule_item in scheduled_meets[user_id]:
+            for schedule_item in scheduled_meets[chat_id]:
                 if schedule_item['day'] == day_of_week and schedule_item['hours'] == hours and schedule_item['minutes'] == minutes:
                     update.message.reply_text('Такое расписание уже существует!')
+                    # Очищаем состояние
+                    if state_key in user_states:
+                        del user_states[state_key]
                     return ConversationHandler.END
             
             # Add new schedule
-            scheduled_meets[user_id].append({
+            scheduled_meets[chat_id].append({
                 'day': day_of_week,
                 'hours': hours,
                 'minutes': minutes
@@ -172,7 +224,7 @@ def process_schedule_add(update: Update, context: CallbackContext) -> int:
                 create_job_for_schedule(
                     context.bot,
                     context.job_queue,
-                    user_id,  # Already an integer
+                    chat_id,
                     day_of_week,
                     hours,
                     minutes
@@ -188,21 +240,25 @@ def process_schedule_add(update: Update, context: CallbackContext) -> int:
             'Например: среда 12:46'
         )
     
+    # Очищаем состояние
+    if state_key in user_states:
+        del user_states[state_key]
+    
     return ConversationHandler.END
 
 def list_schedules(update: Update, context: CallbackContext) -> None:
     """Show all scheduled tasks for the user."""
-    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     
     with schedule_lock:
         load_schedules()
         
-        if user_id not in scheduled_meets or not scheduled_meets[user_id]:
+        if chat_id not in scheduled_meets or not scheduled_meets[chat_id]:
             update.message.reply_text('У вас нет запланированных еженедельных отправок.')
             return
         
         schedules_list = []
-        for schedule_item in scheduled_meets[user_id]:
+        for schedule_item in scheduled_meets[chat_id]:
             day = DAYS_DISPLAY[schedule_item['day']]
             hours = schedule_item['hours']
             minutes = schedule_item['minutes']
@@ -213,12 +269,28 @@ def list_schedules(update: Update, context: CallbackContext) -> None:
 
 def delete_schedule_command(update: Update, context: CallbackContext) -> int:
     """Start the process of deleting a schedule."""
+    chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    
+    # Сохраняем состояние пользователя/чата
+    user_states[f"{chat_id}_{user_id}"] = DELETE_SCHEDULE
+    
+    # Проверяем, является ли отправитель администратором группы, если это групповой чат
+    if update.effective_chat.type in ['group', 'supergroup']:
+        try:
+            member = context.bot.get_chat_member(chat_id, user_id)
+            if member.status not in ['creator', 'administrator']:
+                update.message.reply_text('Только администраторы группы могут управлять расписанием.')
+                return ConversationHandler.END
+        except Exception as e:
+            logger.error(f"Error checking admin status: {e}")
+            update.message.reply_text('Произошла ошибка при проверке прав администратора.')
+            return ConversationHandler.END
     
     with schedule_lock:
         load_schedules()
         
-        if user_id not in scheduled_meets or not scheduled_meets[user_id]:
+        if chat_id not in scheduled_meets or not scheduled_meets[chat_id]:
             update.message.reply_text('У вас нет запланированных еженедельных отправок.')
             return ConversationHandler.END
     
@@ -230,7 +302,14 @@ def delete_schedule_command(update: Update, context: CallbackContext) -> int:
 
 def process_schedule_delete(update: Update, context: CallbackContext) -> int:
     """Process a schedule deletion request."""
+    chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    state_key = f"{chat_id}_{user_id}"
+    
+    # Проверяем состояние пользователя
+    if state_key not in user_states or user_states[state_key] != DELETE_SCHEDULE:
+        return ConversationHandler.END
+    
     text = update.message.text.strip().lower()
     
     try:
@@ -256,9 +335,9 @@ def process_schedule_delete(update: Update, context: CallbackContext) -> int:
         with schedule_lock:
             load_schedules()
             
-            if user_id in scheduled_meets:
+            if chat_id in scheduled_meets:
                 new_schedules = []
-                for schedule_item in scheduled_meets[user_id]:
+                for schedule_item in scheduled_meets[chat_id]:
                     if (schedule_item['day'] == day_of_week and 
                         schedule_item['hours'] == hours and 
                         schedule_item['minutes'] == minutes):
@@ -266,19 +345,19 @@ def process_schedule_delete(update: Update, context: CallbackContext) -> int:
                     else:
                         new_schedules.append(schedule_item)
                 
-                scheduled_meets[user_id] = new_schedules
+                scheduled_meets[chat_id] = new_schedules
                 save_schedules()
                 
                 # Remove the specific job instead of rescheduling everything
                 if hasattr(context, 'job_queue') and context.job_queue:
                     for job in context.job_queue.jobs():
                         job_context = job.context
-                        if (job_context.get('user_id') == user_id and
+                        if (job_context.get('user_id') == chat_id and
                             job_context.get('day') == day_of_week and
                             job_context.get('hours') == hours and
                             job_context.get('minutes') == minutes):
                             job.schedule_removal()
-                            logger.info(f"Removed job for user {user_id} on {DAYS_DISPLAY[day_of_week]} at {hours:02d}:{minutes:02d}")
+                            logger.info(f"Removed job for chat {chat_id} on {DAYS_DISPLAY[day_of_week]} at {hours:02d}:{minutes:02d}")
         
         if deleted:
             update.message.reply_text(
@@ -295,12 +374,16 @@ def process_schedule_delete(update: Update, context: CallbackContext) -> int:
             'Например: среда 12:46'
         )
     
+    # Очищаем состояние
+    if state_key in user_states:
+        del user_states[state_key]
+    
     return ConversationHandler.END
 
 def send_meet_link(context: CallbackContext) -> None:
-    """Send a Google Meet link to the user."""
+    """Send a Google Meet link to the user or group."""
     job = context.job
-    user_id = job.context['user_id']
+    chat_id = job.context['user_id']  # это может быть ID пользователя или группы
     day = job.context['day']
     hours = job.context['hours']
     minutes = job.context['minutes']
@@ -311,23 +394,23 @@ def send_meet_link(context: CallbackContext) -> None:
         
         day_text = DAYS_DISPLAY[day]
         message = context.bot.send_message(
-            chat_id=user_id,
+            chat_id=chat_id,
             text=f'Ваша еженедельная Google Meet встреча ({day_text} {hours:02d}:{minutes:02d}):\n{meet_link}'
         )
         
         # Schedule message deletion after 59 minutes
         context.job_queue.run_once(
-            lambda context: context.bot.delete_message(chat_id=user_id, message_id=message.message_id),
+            lambda context: context.bot.delete_message(chat_id=chat_id, message_id=message.message_id),
             3540,  # 59 minutes
             context=None
         )
         
-        logger.info(f"Sent meet link to user {user_id} for {day_text} {hours:02d}:{minutes:02d}")
+        logger.info(f"Sent meet link to chat {chat_id} for {day_text} {hours:02d}:{minutes:02d}")
     except Exception as e:
         logger.error(f"Error sending meet link: {e}")
         try:
             context.bot.send_message(
-                chat_id=user_id,
+                chat_id=chat_id,
                 text='Произошла ошибка при отправке ссылки на Google Meet.'
             )
         except Exception as inner_e:
@@ -402,17 +485,18 @@ def help_command(update: Update, context: CallbackContext) -> None:
     update.message.reply_text(
         'Команды бота:\n'
         '/start - начать работу с ботом\n'
-        '/help - показать эту справку\n\n'
-        'Функции:\n'
-        '1. "Добавить еженедельную отправку" - создать новую еженедельную отправку ссылки Google Meet\n'
-        '2. "Посмотреть отправки" - просмотреть все ваши еженедельные отправки\n'
-        '3. "Удалить отправку" - удалить существующую еженедельную отправку\n'
-        '4. "Мгновенная встреча" - получить ссылку на встречу Google Meet немедленно'
+        '/help - показать эту справку\n'
+        '/add - добавить еженедельную отправку\n'
+        '/list - просмотреть все отправки\n'
+        '/delete - удалить отправку\n'
+        '/meet - получить мгновенную ссылку на встречу\n\n'
+        'Бот поддерживает работу как в личных чатах, так и в группах.\n'
+        'В группах управлять расписанием могут только администраторы.'
     )
 
 def send_instant_meet_link(update: Update, context: CallbackContext) -> None:
     """Send an instant Google Meet link to the user."""
-    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     
     try:
         # Use static Google Meet link
@@ -423,12 +507,12 @@ def send_instant_meet_link(update: Update, context: CallbackContext) -> None:
         
         # Schedule message deletion after 59 minutes
         context.job_queue.run_once(
-            lambda context: context.bot.delete_message(chat_id=user_id, message_id=message.message_id),
+            lambda context: context.bot.delete_message(chat_id=chat_id, message_id=message.message_id),
             3540,  # 59 minutes
             context=None
         )
         
-        logger.info(f"Sent instant meet link to user {user_id}")
+        logger.info(f"Sent instant meet link to chat {chat_id}")
     except Exception as e:
         logger.error(f"Error sending instant meet link: {e}")
         update.message.reply_text('Произошла ошибка при отправке ссылки на Google Meet.')
@@ -436,19 +520,33 @@ def send_instant_meet_link(update: Update, context: CallbackContext) -> None:
 def handle_text(update: Update, context: CallbackContext) -> None:
     """Handle text messages."""
     text = update.message.text.strip()
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    state_key = f"{chat_id}_{user_id}"
     
-    if text == 'Добавить еженедельную отправку':
+    # Проверяем, если пользователь находится в состоянии диалога
+    if state_key in user_states:
+        state = user_states[state_key]
+        if state == ADD_SCHEDULE:
+            return process_schedule_add(update, context)
+        elif state == DELETE_SCHEDULE:
+            return process_schedule_delete(update, context)
+    
+    # Если это не состояние диалога, обрабатываем команды
+    if text == '/add' or text == 'Добавить еженедельную отправку':
         return add_schedule_command(update, context)
-    elif text == 'Посмотреть отправки':
+    elif text == '/list' or text == 'Посмотреть отправки':
         return list_schedules(update, context)
-    elif text == 'Удалить отправку':
+    elif text == '/delete' or text == 'Удалить отправку':
         return delete_schedule_command(update, context)
-    elif text == 'Мгновенная встреча':
+    elif text == '/meet' or text == 'Мгновенная встреча':
         return send_instant_meet_link(update, context)
     else:
-        update.message.reply_text(
-            'Используйте кнопки меню или команды /start и /help'
-        )
+        # Не отвечаем на случайные сообщения в группах
+        if update.effective_chat.type in ['private']:
+            update.message.reply_text(
+                'Используйте команды меню или /help для справки'
+            )
 
 def cleanup():
     """Clean up resources before exiting."""
@@ -489,43 +587,26 @@ def main() -> None:
         # Get the dispatcher to register handlers
         dispatcher = updater.dispatcher
         
-        # Add conversation handlers
-        conv_handler = ConversationHandler(
-            entry_points=[
-                CommandHandler('add', add_schedule_command),
-                MessageHandler(Filters.regex('^Добавить еженедельную отправку$'), add_schedule_command)
-            ],
-            states={
-                ADD_SCHEDULE: [MessageHandler(Filters.text & ~Filters.command, process_schedule_add)],
-            },
-            fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
-        )
-        
-        del_handler = ConversationHandler(
-            entry_points=[
-                CommandHandler('delete', delete_schedule_command),
-                MessageHandler(Filters.regex('^Удалить отправку$'), delete_schedule_command)
-            ],
-            states={
-                DELETE_SCHEDULE: [MessageHandler(Filters.text & ~Filters.command, process_schedule_delete)],
-            },
-            fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
-        )
-        
         # Add handlers
         dispatcher.add_handler(CommandHandler("start", start))
         dispatcher.add_handler(CommandHandler("help", help_command))
-        dispatcher.add_handler(conv_handler)
-        dispatcher.add_handler(del_handler)
-        dispatcher.add_handler(MessageHandler(Filters.regex('^Посмотреть отправки$'), list_schedules))
+        dispatcher.add_handler(CommandHandler("meet", send_instant_meet_link))
+        dispatcher.add_handler(CommandHandler("list", list_schedules))
+        dispatcher.add_handler(CommandHandler("add", add_schedule_command))
+        dispatcher.add_handler(CommandHandler("delete", delete_schedule_command))
+        
+        # Обработка текстовых сообщений
         dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
+        
+        # Setup bot commands in menu
+        setup_commands(updater)
         
         # Setup schedules using the job_queue from the updater
         load_schedules()
         setup_schedules(updater.job_queue, updater.bot)
         
         # Start the Bot
-        updater.start_polling()
+        updater.start_polling(allowed_updates=["message", "callback_query", "chat_member"])
         logger.info("Bot started")
         
         # Run the bot until you press Ctrl-C
