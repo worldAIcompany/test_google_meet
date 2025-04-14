@@ -172,9 +172,11 @@ def process_schedule_add(update: Update, context: CallbackContext) -> int:
     
     # Проверяем состояние пользователя
     if state_key not in user_states or user_states[state_key] != ADD_SCHEDULE:
+        logger.info(f"Received message without valid state: {update.message.text} from {user_id} in chat {chat_id}")
         return ConversationHandler.END
     
     text = update.message.text.strip().lower()
+    logger.info(f"Processing add schedule: {text} from user {user_id} in chat {chat_id}")
     
     try:
         day_text, time_text = text.split(' ', 1)
@@ -308,9 +310,11 @@ def process_schedule_delete(update: Update, context: CallbackContext) -> int:
     
     # Проверяем состояние пользователя
     if state_key not in user_states or user_states[state_key] != DELETE_SCHEDULE:
+        logger.info(f"Received message without valid delete state: {update.message.text} from {user_id} in chat {chat_id}")
         return ConversationHandler.END
     
     text = update.message.text.strip().lower()
+    logger.info(f"Processing delete schedule: {text} from user {user_id} in chat {chat_id}")
     
     try:
         day_text, time_text = text.split(' ', 1)
@@ -519,27 +523,33 @@ def send_instant_meet_link(update: Update, context: CallbackContext) -> None:
 
 def handle_text(update: Update, context: CallbackContext) -> None:
     """Handle text messages."""
+    if not update.message:
+        return
+        
     text = update.message.text.strip()
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     state_key = f"{chat_id}_{user_id}"
     
+    logger.info(f"Received text: '{text}' from user {user_id} in chat {chat_id}")
+    
     # Проверяем, если пользователь находится в состоянии диалога
     if state_key in user_states:
         state = user_states[state_key]
+        logger.info(f"User {user_id} in chat {chat_id} has state: {state}")
         if state == ADD_SCHEDULE:
             return process_schedule_add(update, context)
         elif state == DELETE_SCHEDULE:
             return process_schedule_delete(update, context)
     
     # Если это не состояние диалога, обрабатываем команды
-    if text == '/add' or text == 'Добавить еженедельную отправку':
+    if text.startswith('/add') or text == 'Добавить еженедельную отправку':
         return add_schedule_command(update, context)
-    elif text == '/list' or text == 'Посмотреть отправки':
+    elif text.startswith('/list') or text == 'Посмотреть отправки':
         return list_schedules(update, context)
-    elif text == '/delete' or text == 'Удалить отправку':
+    elif text.startswith('/delete') or text == 'Удалить отправку':
         return delete_schedule_command(update, context)
-    elif text == '/meet' or text == 'Мгновенная встреча':
+    elif text.startswith('/meet') or text == 'Мгновенная встреча':
         return send_instant_meet_link(update, context)
     else:
         # Не отвечаем на случайные сообщения в группах
