@@ -315,10 +315,10 @@ def send_meet_link(context: CallbackContext) -> None:
             text=f'Ваша еженедельная Google Meet встреча ({day_text} {hours:02d}:{minutes:02d}):\n{meet_link}'
         )
         
-        # Schedule message deletion after 10 seconds
+        # Schedule message deletion after 59 minutes
         context.job_queue.run_once(
             lambda context: context.bot.delete_message(chat_id=user_id, message_id=message.message_id),
-            10,  # 10 seconds
+            3540,  # 59 minutes
             context=None
         )
         
@@ -421,10 +421,10 @@ def send_instant_meet_link(update: Update, context: CallbackContext) -> None:
         # Send message
         message = update.message.reply_text(f'Ваша мгновенная Google Meet ссылка:\n{meet_link}')
         
-        # Schedule message deletion after 10 seconds
+        # Schedule message deletion after 59 minutes
         context.job_queue.run_once(
             lambda context: context.bot.delete_message(chat_id=user_id, message_id=message.message_id),
-            10,  # 10 seconds
+            3540,  # 59 minutes
             context=None
         )
         
