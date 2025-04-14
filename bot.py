@@ -330,7 +330,17 @@ def process_schedule_delete(update: Update, context: CallbackContext) -> int:
     logger.info(f"Processing delete schedule: {text} from user {user_id} in chat {chat_id}")
     
     try:
-        day_text, time_text = text.split(' ', 1)
+        # Раздельный анализ формата "день ЧЧ:ММ"
+        parts = text.split()
+        
+        if len(parts) != 2:
+            update.message.reply_text(
+                'Некорректный формат. Используйте точно формат "день ЧЧ:ММ", например: среда 12:46'
+            )
+            return DELETE_SCHEDULE
+            
+        day_text = parts[0]
+        time_text = parts[1]
         
         if day_text not in DAYS_RU:
             update.message.reply_text(
@@ -352,6 +362,9 @@ def process_schedule_delete(update: Update, context: CallbackContext) -> int:
         with schedule_lock:
             load_schedules()
             
+            # Логируем текущее состояние расписания перед удалением
+            logger.info(f"Current schedules before deletion for chat {chat_id}: {scheduled_meets.get(chat_id, [])}")
+            
             if chat_id in scheduled_meets:
                 new_schedules = []
                 for schedule_item in scheduled_meets[chat_id]:
@@ -359,11 +372,15 @@ def process_schedule_delete(update: Update, context: CallbackContext) -> int:
                         schedule_item['hours'] == hours and 
                         schedule_item['minutes'] == minutes):
                         deleted = True
+                        logger.info(f"Deleting schedule: {day_text} {hours:02d}:{minutes:02d} for chat {chat_id}")
                     else:
                         new_schedules.append(schedule_item)
                 
                 scheduled_meets[chat_id] = new_schedules
                 save_schedules()
+                
+                # Логируем состояние расписания после удаления
+                logger.info(f"Schedules after deletion for chat {chat_id}: {scheduled_meets.get(chat_id, [])}")
                 
                 # Remove the specific job instead of rescheduling everything
                 if hasattr(context, 'job_queue') and context.job_queue:
@@ -385,7 +402,7 @@ def process_schedule_delete(update: Update, context: CallbackContext) -> int:
                 f'Отправка {day_text} {hours:02d}:{minutes:02d} не найдена'
             )
     except Exception as e:
-        logger.error(f"Error deleting schedule: {e}")
+        logger.error(f"Error deleting schedule: {e}", exc_info=True)
         update.message.reply_text(
             'Произошла ошибка. Убедитесь, что формат "день ЧЧ:ММ" правильный.\n'
             'Например: среда 12:46'
@@ -629,36 +646,46 @@ def add_schedule_direct(update: Update, context: CallbackContext) -> None:
         return
     
     # Разбираем аргументы (день и время)
-    args = parts[1].strip().lower().split()
+    arguments = parts[1].strip().lower()
     
-    if len(args) < 2:
+    # Проверяем, есть ли в тексте день недели
+    day_found = False
+    for day in DAYS_RU.keys():
+        if day in arguments:
+            day_text = day
+            day_found = True
+            # Удаляем день из строки, чтобы проще было найти время
+            remaining_text = arguments.replace(day, "").strip()
+            break
+    
+    if not day_found:
         update.message.reply_text(
-            'Пожалуйста, укажите день и время в формате: /addtime день ЧЧ:ММ\n'
+            f'Некорректный день недели. Используйте: {", ".join(DAYS_RU.keys())}\n'
             'Например: /addtime среда 12:46'
         )
         return
     
-    day_text = args[0]
-    time_text = args[1]
+    # Ищем время в формате ЧЧ:ММ в оставшемся тексте
+    import re
+    time_match = re.search(r'(\d{1,2}):(\d{2})', remaining_text)
+    if not time_match:
+        update.message.reply_text(
+            'Некорректный формат времени. Используйте ЧЧ:ММ, например 12:46\n'
+            'Например: /addtime среда 12:46'
+        )
+        return
     
-    logger.info(f"Processing direct add: day={day_text}, time={time_text} from user {user_id} in chat {chat_id}, thread_id={thread_id}")
+    hours = int(time_match.group(1))
+    minutes = int(time_match.group(2))
+    
+    if not (0 <= hours < 24 and 0 <= minutes < 60):
+        update.message.reply_text('Некорректное время. Часы должны быть от 0 до 23, минуты от 0 до 59.')
+        return
+    
+    logger.info(f"Processing direct add: day={day_text}, time={hours}:{minutes:02d} from user {user_id} in chat {chat_id}, thread_id={thread_id}")
     
     try:
-        if day_text not in DAYS_RU:
-            update.message.reply_text(
-                f'Некорректный день недели. Используйте: {", ".join(DAYS_RU.keys())}'
-            )
-            return
-        
         day_of_week = DAYS_RU[day_text]
-        
-        try:
-            hours, minutes = map(int, time_text.split(':'))
-            if not (0 <= hours < 24 and 0 <= minutes < 60):
-                raise ValueError("Invalid time")
-        except:
-            update.message.reply_text('Некорректный формат времени. Используйте ЧЧ:ММ, например 12:46')
-            return
         
         with schedule_lock:
             load_schedules()
@@ -749,36 +776,46 @@ def delete_schedule_direct(update: Update, context: CallbackContext) -> None:
         return
     
     # Разбираем аргументы (день и время)
-    args = parts[1].strip().lower().split()
+    arguments = parts[1].strip().lower()
     
-    if len(args) < 2:
+    # Проверяем, есть ли в тексте день недели
+    day_found = False
+    for day in DAYS_RU.keys():
+        if day in arguments:
+            day_text = day
+            day_found = True
+            # Удаляем день из строки, чтобы проще было найти время
+            remaining_text = arguments.replace(day, "").strip()
+            break
+    
+    if not day_found:
         update.message.reply_text(
-            'Пожалуйста, укажите день и время в формате: /deletetime день ЧЧ:ММ\n'
+            f'Некорректный день недели. Используйте: {", ".join(DAYS_RU.keys())}\n'
             'Например: /deletetime среда 12:46'
         )
         return
     
-    day_text = args[0]
-    time_text = args[1]
+    # Ищем время в формате ЧЧ:ММ в оставшемся тексте
+    import re
+    time_match = re.search(r'(\d{1,2}):(\d{2})', remaining_text)
+    if not time_match:
+        update.message.reply_text(
+            'Некорректный формат времени. Используйте ЧЧ:ММ, например 12:46\n'
+            'Например: /deletetime среда 12:46'
+        )
+        return
     
-    logger.info(f"Processing direct delete: day={day_text}, time={time_text} from user {user_id} in chat {chat_id}, thread_id={thread_id}")
+    hours = int(time_match.group(1))
+    minutes = int(time_match.group(2))
+    
+    if not (0 <= hours < 24 and 0 <= minutes < 60):
+        update.message.reply_text('Некорректное время. Часы должны быть от 0 до 23, минуты от 0 до 59.')
+        return
+    
+    logger.info(f"Processing direct delete: day={day_text}, time={hours}:{minutes:02d} from user {user_id} in chat {chat_id}, thread_id={thread_id}")
     
     try:
-        if day_text not in DAYS_RU:
-            update.message.reply_text(
-                f'Некорректный день недели. Используйте: {", ".join(DAYS_RU.keys())}'
-            )
-            return
-        
         day_of_week = DAYS_RU[day_text]
-        
-        try:
-            hours, minutes = map(int, time_text.split(':'))
-            if not (0 <= hours < 24 and 0 <= minutes < 60):
-                raise ValueError("Invalid time")
-        except:
-            update.message.reply_text('Некорректный формат времени. Используйте ЧЧ:ММ, например 12:46')
-            return
         
         deleted = False
         with schedule_lock:
