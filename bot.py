@@ -30,6 +30,11 @@ def check_single_instance():
     """Ensure only one instance of the bot is running."""
     global lock_file_handle
     
+    # Skip lock check if running under PM2
+    if os.environ.get('PM2_HOME') is not None:
+        logger.info("Running under PM2, skipping lock check")
+        return True
+    
     try:
         # Open the lock file
         lock_file_handle = open(LOCK_FILE, 'w')
@@ -98,7 +103,8 @@ def start(update: Update, context: CallbackContext) -> None:
     keyboard = [
         ['Добавить еженедельную отправку'],
         ['Посмотреть отправки'],
-        ['Удалить отправку']
+        ['Удалить отправку'],
+        ['Мгновенная встреча']
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -300,22 +306,23 @@ def send_meet_link(context: CallbackContext) -> None:
     minutes = job.context['minutes']
     
     try:
-        # Generate a new Google Meet link
-        meet_link = google_meet()
+        # Use static Google Meet link
+        meet_link = "https://meet.google.com/pep-zuux-ubg"
         
-        if meet_link:
-            day_text = DAYS_DISPLAY[day]
-            context.bot.send_message(
-                chat_id=user_id,
-                text=f'Ваша еженедельная Google Meet встреча ({day_text} {hours:02d}:{minutes:02d}):\n{meet_link}'
-            )
-            logger.info(f"Sent meet link to user {user_id} for {day_text} {hours:02d}:{minutes:02d}")
-        else:
-            context.bot.send_message(
-                chat_id=user_id,
-                text='Не удалось создать ссылку на Google Meet. Пожалуйста, проверьте настройки.'
-            )
-            logger.error(f"Failed to create meet link for user {user_id}")
+        day_text = DAYS_DISPLAY[day]
+        message = context.bot.send_message(
+            chat_id=user_id,
+            text=f'Ваша еженедельная Google Meet встреча ({day_text} {hours:02d}:{minutes:02d}):\n{meet_link}'
+        )
+        
+        # Schedule message deletion after 10 seconds
+        context.job_queue.run_once(
+            lambda context: context.bot.delete_message(chat_id=user_id, message_id=message.message_id),
+            10,  # 10 seconds
+            context=None
+        )
+        
+        logger.info(f"Sent meet link to user {user_id} for {day_text} {hours:02d}:{minutes:02d}")
     except Exception as e:
         logger.error(f"Error sending meet link: {e}")
         try:
@@ -399,8 +406,32 @@ def help_command(update: Update, context: CallbackContext) -> None:
         'Функции:\n'
         '1. "Добавить еженедельную отправку" - создать новую еженедельную отправку ссылки Google Meet\n'
         '2. "Посмотреть отправки" - просмотреть все ваши еженедельные отправки\n'
-        '3. "Удалить отправку" - удалить существующую еженедельную отправку'
+        '3. "Удалить отправку" - удалить существующую еженедельную отправку\n'
+        '4. "Мгновенная встреча" - получить ссылку на встречу Google Meet немедленно'
     )
+
+def send_instant_meet_link(update: Update, context: CallbackContext) -> None:
+    """Send an instant Google Meet link to the user."""
+    user_id = update.effective_user.id
+    
+    try:
+        # Use static Google Meet link
+        meet_link = "https://meet.google.com/pep-zuux-ubg"
+        
+        # Send message
+        message = update.message.reply_text(f'Ваша мгновенная Google Meet ссылка:\n{meet_link}')
+        
+        # Schedule message deletion after 10 seconds
+        context.job_queue.run_once(
+            lambda context: context.bot.delete_message(chat_id=user_id, message_id=message.message_id),
+            10,  # 10 seconds
+            context=None
+        )
+        
+        logger.info(f"Sent instant meet link to user {user_id}")
+    except Exception as e:
+        logger.error(f"Error sending instant meet link: {e}")
+        update.message.reply_text('Произошла ошибка при отправке ссылки на Google Meet.')
 
 def handle_text(update: Update, context: CallbackContext) -> None:
     """Handle text messages."""
@@ -412,6 +443,8 @@ def handle_text(update: Update, context: CallbackContext) -> None:
         return list_schedules(update, context)
     elif text == 'Удалить отправку':
         return delete_schedule_command(update, context)
+    elif text == 'Мгновенная встреча':
+        return send_instant_meet_link(update, context)
     else:
         update.message.reply_text(
             'Используйте кнопки меню или команды /start и /help'
@@ -420,6 +453,11 @@ def handle_text(update: Update, context: CallbackContext) -> None:
 def cleanup():
     """Clean up resources before exiting."""
     global lock_file_handle
+    
+    # Skip cleanup if running under PM2
+    if os.environ.get('PM2_HOME') is not None:
+        logger.info("Running under PM2, skipping lock cleanup")
+        return
     
     # Release the lock and close the file handle
     if lock_file_handle:
