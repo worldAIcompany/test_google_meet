@@ -254,6 +254,9 @@ def list_schedules(update: Update, context: CallbackContext) -> None:
     """Show all scheduled tasks for the user."""
     chat_id = update.effective_chat.id
     
+    # Получаем thread_id (ID темы), если сообщение из темы в супергруппе
+    thread_id = update.message.message_thread_id if hasattr(update.message, 'message_thread_id') else None
+    
     with schedule_lock:
         load_schedules()
         
@@ -263,11 +266,19 @@ def list_schedules(update: Update, context: CallbackContext) -> None:
         
         schedules_list = []
         for schedule_item in scheduled_meets[chat_id]:
+            # Если сообщение из темы, показываем только настройки для этой темы
+            if thread_id is not None and schedule_item.get('thread_id') != thread_id:
+                continue
+                
             day = DAYS_DISPLAY[schedule_item['day']]
             hours = schedule_item['hours']
             minutes = schedule_item['minutes']
             schedules_list.append(f"{day} {hours:02d}:{minutes:02d}")
         
+        if not schedules_list and thread_id is not None:
+            update.message.reply_text('В этой теме нет запланированных еженедельных отправок.')
+            return
+            
         message = "Ваши еженедельные отправки:\n" + "\n".join(schedules_list)
         update.message.reply_text(message)
 
@@ -393,36 +404,59 @@ def send_meet_link(context: CallbackContext) -> None:
     day = job.context['day']
     hours = job.context['hours']
     minutes = job.context['minutes']
+    thread_id = job.context.get('thread_id')  # Получаем thread_id из контекста, если есть
     
     try:
         # Use static Google Meet link
         meet_link = "https://meet.google.com/pep-zuux-ubg"
         
         day_text = DAYS_DISPLAY[day]
-        message = context.bot.send_message(
-            chat_id=chat_id,
-            text=f'Ваша еженедельная Google Meet встреча ({day_text} {hours:02d}:{minutes:02d}):\n{meet_link}'
-        )
+        
+        # Параметры сообщения
+        send_params = {
+            'chat_id': chat_id,
+            'text': f'Ваша еженедельная Google Meet встреча ({day_text} {hours:02d}:{minutes:02d}):\n{meet_link}'
+        }
+        
+        # Добавляем параметр message_thread_id, если thread_id указан
+        if thread_id is not None:
+            send_params['message_thread_id'] = thread_id
+        
+        # Отправляем сообщение
+        message = context.bot.send_message(**send_params)
+        
+        # Параметры удаления сообщения
+        delete_params = {
+            'chat_id': chat_id,
+            'message_id': message.message_id
+        }
         
         # Schedule message deletion after 59 minutes
         context.job_queue.run_once(
-            lambda context: context.bot.delete_message(chat_id=chat_id, message_id=message.message_id),
+            lambda context: context.bot.delete_message(**delete_params),
             3540,  # 59 minutes
             context=None
         )
         
-        logger.info(f"Sent meet link to chat {chat_id} for {day_text} {hours:02d}:{minutes:02d}")
+        logger.info(f"Sent meet link to chat {chat_id} for {day_text} {hours:02d}:{minutes:02d}, thread_id={thread_id}")
     except Exception as e:
         logger.error(f"Error sending meet link: {e}")
         try:
-            context.bot.send_message(
-                chat_id=chat_id,
-                text='Произошла ошибка при отправке ссылки на Google Meet.'
-            )
+            # Параметры сообщения об ошибке
+            send_params = {
+                'chat_id': chat_id,
+                'text': 'Произошла ошибка при отправке ссылки на Google Meet.'
+            }
+            
+            # Добавляем параметр message_thread_id, если thread_id указан
+            if thread_id is not None:
+                send_params['message_thread_id'] = thread_id
+            
+            context.bot.send_message(**send_params)
         except Exception as inner_e:
             logger.error(f"Failed to send error message: {inner_e}")
 
-def create_job_for_schedule(bot, job_queue, user_id, day, hours, minutes):
+def create_job_for_schedule(bot, job_queue, user_id, day, hours, minutes, thread_id=None):
     """Create a job for the scheduler."""
     # We run the job at the specified time on the specified day of the week
     target_day = day
@@ -451,6 +485,10 @@ def create_job_for_schedule(bot, job_queue, user_id, day, hours, minutes):
         'minutes': minutes
     }
     
+    # Добавляем thread_id в контекст, если он есть
+    if thread_id is not None:
+        job_context['thread_id'] = thread_id
+    
     # Schedule the job with job_queue from telegram.ext
     job_queue.run_repeating(
         send_meet_link,
@@ -459,7 +497,7 @@ def create_job_for_schedule(bot, job_queue, user_id, day, hours, minutes):
         context=job_context
     )
     
-    logger.info(f"Scheduled job for user {user_id} on {DAYS_DISPLAY[day]} at {hours:02d}:{minutes:02d}")
+    logger.info(f"Scheduled job for user {user_id} on {DAYS_DISPLAY[day]} at {hours:02d}:{minutes:02d}, thread_id={thread_id}")
 
 def setup_schedules(job_queue, bot) -> None:
     """Setup all schedules for all users."""
@@ -475,6 +513,7 @@ def setup_schedules(job_queue, bot) -> None:
                 day = schedule_item['day']
                 hours = schedule_item['hours']
                 minutes = schedule_item['minutes']
+                thread_id = schedule_item.get('thread_id')  # Получаем thread_id, если он есть
                 
                 # Create a job with the telegram job queue
                 create_job_for_schedule(
@@ -483,7 +522,8 @@ def setup_schedules(job_queue, bot) -> None:
                     int(user_id),  # Ensure user_id is an integer
                     day,
                     hours,
-                    minutes
+                    minutes,
+                    thread_id
                 )
 
 def help_command(update: Update, context: CallbackContext) -> None:
@@ -516,21 +556,38 @@ def send_instant_meet_link(update: Update, context: CallbackContext) -> None:
     """Send an instant Google Meet link to the user."""
     chat_id = update.effective_chat.id
     
+    # Получаем thread_id (ID темы), если сообщение из темы в супергруппе
+    thread_id = update.message.message_thread_id if hasattr(update.message, 'message_thread_id') else None
+    
     try:
         # Use static Google Meet link
         meet_link = "https://meet.google.com/pep-zuux-ubg"
         
-        # Send message
-        message = update.message.reply_text(f'Ваша мгновенная Google Meet ссылка:\n{meet_link}')
+        # Параметры сообщения
+        send_params = {
+            'text': f'Ваша мгновенная Google Meet ссылка:\n{meet_link}'
+        }
+        
+        # Добавляем параметр message_thread_id, если thread_id указан
+        if thread_id is not None:
+            message = update.message.reply_text(**send_params)
+        else:
+            message = update.message.reply_text(**send_params)
+        
+        # Параметры удаления сообщения
+        delete_params = {
+            'chat_id': chat_id,
+            'message_id': message.message_id
+        }
         
         # Schedule message deletion after 59 minutes
         context.job_queue.run_once(
-            lambda context: context.bot.delete_message(chat_id=chat_id, message_id=message.message_id),
+            lambda context: context.bot.delete_message(**delete_params),
             3540,  # 59 minutes
             context=None
         )
         
-        logger.info(f"Sent instant meet link to chat {chat_id}")
+        logger.info(f"Sent instant meet link to chat {chat_id}, thread_id={thread_id}")
     except Exception as e:
         logger.error(f"Error sending instant meet link: {e}")
         update.message.reply_text('Произошла ошибка при отправке ссылки на Google Meet.')
@@ -539,6 +596,9 @@ def add_schedule_direct(update: Update, context: CallbackContext) -> None:
     """Directly add a schedule without conversation (for groups)."""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    
+    # Получаем thread_id (ID темы), если сообщение из темы в супергруппе
+    thread_id = update.message.message_thread_id if hasattr(update.message, 'message_thread_id') else None
     
     # Проверяем, является ли отправитель администратором группы, если это групповой чат
     if update.effective_chat.type in ['group', 'supergroup']:
@@ -581,7 +641,7 @@ def add_schedule_direct(update: Update, context: CallbackContext) -> None:
     day_text = args[0]
     time_text = args[1]
     
-    logger.info(f"Processing direct add: day={day_text}, time={time_text} from user {user_id} in chat {chat_id}")
+    logger.info(f"Processing direct add: day={day_text}, time={time_text} from user {user_id} in chat {chat_id}, thread_id={thread_id}")
     
     try:
         if day_text not in DAYS_RU:
@@ -608,16 +668,25 @@ def add_schedule_direct(update: Update, context: CallbackContext) -> None:
             
             # Check if this schedule already exists
             for schedule_item in scheduled_meets[chat_id]:
-                if schedule_item['day'] == day_of_week and schedule_item['hours'] == hours and schedule_item['minutes'] == minutes:
+                if (schedule_item['day'] == day_of_week and 
+                    schedule_item['hours'] == hours and 
+                    schedule_item['minutes'] == minutes and
+                    schedule_item.get('thread_id') == thread_id):
                     update.message.reply_text('Такое расписание уже существует!')
                     return
             
-            # Add new schedule
-            scheduled_meets[chat_id].append({
+            # Add new schedule with thread_id
+            new_schedule = {
                 'day': day_of_week,
                 'hours': hours,
                 'minutes': minutes
-            })
+            }
+            
+            # Добавляем thread_id, если он есть
+            if thread_id is not None:
+                new_schedule['thread_id'] = thread_id
+            
+            scheduled_meets[chat_id].append(new_schedule)
             
             save_schedules()
             
@@ -629,7 +698,8 @@ def add_schedule_direct(update: Update, context: CallbackContext) -> None:
                     chat_id,
                     day_of_week,
                     hours,
-                    minutes
+                    minutes,
+                    thread_id
                 )
         
         update.message.reply_text(
@@ -646,6 +716,9 @@ def delete_schedule_direct(update: Update, context: CallbackContext) -> None:
     """Directly delete a schedule without conversation (for groups)."""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    
+    # Получаем thread_id (ID темы), если сообщение из темы в супергруппе
+    thread_id = update.message.message_thread_id if hasattr(update.message, 'message_thread_id') else None
     
     # Проверяем, является ли отправитель администратором группы, если это групповой чат
     if update.effective_chat.type in ['group', 'supergroup']:
@@ -688,7 +761,7 @@ def delete_schedule_direct(update: Update, context: CallbackContext) -> None:
     day_text = args[0]
     time_text = args[1]
     
-    logger.info(f"Processing direct delete: day={day_text}, time={time_text} from user {user_id} in chat {chat_id}")
+    logger.info(f"Processing direct delete: day={day_text}, time={time_text} from user {user_id} in chat {chat_id}, thread_id={thread_id}")
     
     try:
         if day_text not in DAYS_RU:
@@ -716,7 +789,8 @@ def delete_schedule_direct(update: Update, context: CallbackContext) -> None:
                 for schedule_item in scheduled_meets[chat_id]:
                     if (schedule_item['day'] == day_of_week and 
                         schedule_item['hours'] == hours and 
-                        schedule_item['minutes'] == minutes):
+                        schedule_item['minutes'] == minutes and
+                        schedule_item.get('thread_id') == thread_id):
                         deleted = True
                     else:
                         new_schedules.append(schedule_item)
@@ -731,9 +805,10 @@ def delete_schedule_direct(update: Update, context: CallbackContext) -> None:
                         if (job_context.get('user_id') == chat_id and
                             job_context.get('day') == day_of_week and
                             job_context.get('hours') == hours and
-                            job_context.get('minutes') == minutes):
+                            job_context.get('minutes') == minutes and
+                            job_context.get('thread_id') == thread_id):
                             job.schedule_removal()
-                            logger.info(f"Removed job for chat {chat_id} on {DAYS_DISPLAY[day_of_week]} at {hours:02d}:{minutes:02d}")
+                            logger.info(f"Removed job for chat {chat_id} on {DAYS_DISPLAY[day_of_week]} at {hours:02d}:{minutes:02d}, thread_id={thread_id}")
         
         if deleted:
             update.message.reply_text(
