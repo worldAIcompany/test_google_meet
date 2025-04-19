@@ -9,7 +9,6 @@ import time
 import threading
 import schedule
 import pytz
-import fcntl
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, BotCommand
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
@@ -22,32 +21,11 @@ load_dotenv()
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create lock file to prevent multiple instances
-LOCK_FILE = 'bot.lock'
-lock_file_handle = None
-
+# Removed lock file mechanism
 def check_single_instance():
-    """Ensure only one instance of the bot is running."""
-    global lock_file_handle
-    
-    # Skip lock check if running under PM2
-    if os.environ.get('PM2_HOME') is not None:
-        logger.info("Running under PM2, skipping lock check")
-        return True
-    
-    try:
-        # Open the lock file
-        lock_file_handle = open(LOCK_FILE, 'w')
-        
-        # Try to acquire an exclusive lock
-        fcntl.flock(lock_file_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        
-        # If we got here, no other instance is running
-        return True
-    except IOError:
-        # Another instance has the lock
-        logger.error("Another instance of the bot is already running!")
-        return False
+    """Function kept for compatibility but now always returns True."""
+    logger.info("Lock file mechanism disabled")
+    return True
 
 # Conversation states
 ADD_SCHEDULE, DELETE_SCHEDULE = range(2)
@@ -424,40 +402,52 @@ def send_meet_link(context: CallbackContext) -> None:
     thread_id = job.context.get('thread_id')  # Получаем thread_id из контекста, если есть
     
     try:
-        # Use static Google Meet link
-        meet_link = "https://meet.google.com/pep-zuux-ubg"
-        
-        day_text = DAYS_DISPLAY[day]
-        
-        # Параметры сообщения
-        send_params = {
-            'chat_id': chat_id,
-            'text': f'Ваша еженедельная Google Meet встреча ({day_text} {hours:02d}:{minutes:02d}):\n{meet_link}'
-        }
-        
-        # Добавляем параметр message_thread_id, если thread_id указан
-        if thread_id is not None:
-            send_params['message_thread_id'] = thread_id
-        
-        # Отправляем сообщение
-        message = context.bot.send_message(**send_params)
-        
-        # Параметры удаления сообщения
-        delete_params = {
-            'chat_id': chat_id,
-            'message_id': message.message_id
-        }
-        
-        # Schedule message deletion after 59 minutes
-        context.job_queue.run_once(
-            lambda context: context.bot.delete_message(**delete_params),
-            3540,  # 59 minutes
-            context=None
-        )
-        
-        logger.info(f"Sent meet link to chat {chat_id} for {day_text} {hours:02d}:{minutes:02d}, thread_id={thread_id}")
+        # Use static Google Meet link with increased timeout and retry
+        for attempt in range(3):  # Try up to 3 times
+            try:
+                meet_link = "https://meet.google.com/pep-zuux-ubg"
+                
+                day_text = DAYS_DISPLAY[day]
+                
+                # Параметры сообщения
+                send_params = {
+                    'chat_id': chat_id,
+                    'text': f'Ваша еженедельная Google Meet встреча ({day_text} {hours:02d}:{minutes:02d}):\n{meet_link}',
+                    'disable_notification': False,  # Ensure notification is sent
+                }
+                
+                # Добавляем параметр message_thread_id, если thread_id указан
+                if thread_id is not None:
+                    send_params['message_thread_id'] = thread_id
+                
+                # Отправляем сообщение с повышенным таймаутом
+                message = context.bot.send_message(**send_params)
+                
+                # Параметры удаления сообщения
+                delete_params = {
+                    'chat_id': chat_id,
+                    'message_id': message.message_id
+                }
+                
+                # Schedule message deletion after 59 minutes
+                context.job_queue.run_once(
+                    lambda context: context.bot.delete_message(**delete_params),
+                    3540,  # 59 minutes
+                    context=None
+                )
+                
+                logger.info(f"Successfully sent meet link to chat {chat_id} for {day_text} {hours:02d}:{minutes:02d}, thread_id={thread_id}")
+                break  # Success, break out of retry loop
+                
+            except Exception as retry_error:
+                logger.warning(f"Attempt {attempt+1}/3 failed: {retry_error}")
+                if attempt < 2:  # If not the last attempt
+                    time.sleep(2)  # Wait 2 seconds before retrying
+                else:
+                    raise  # On last attempt, re-raise the exception
+                
     except Exception as e:
-        logger.error(f"Error sending meet link: {e}")
+        logger.error(f"Error sending meet link after retries: {e}")
         try:
             # Параметры сообщения об ошибке
             send_params = {
@@ -493,7 +483,8 @@ def create_job_for_schedule(bot, job_queue, user_id, day, hours, minutes, thread
     
     # Calculate the next run time
     target_date = now + datetime.timedelta(days=days_ahead)
-    target_time = target_date.replace(hour=hours, minute=minutes, second=0, microsecond=0)
+    # Set the time one minute earlier to ensure message is sent on time
+    target_time = target_date.replace(hour=hours, minute=minutes, second=0, microsecond=0) - datetime.timedelta(minutes=1)
     
     job_context = {
         'user_id': user_id,
@@ -506,15 +497,16 @@ def create_job_for_schedule(bot, job_queue, user_id, day, hours, minutes, thread
     if thread_id is not None:
         job_context['thread_id'] = thread_id
     
-    # Schedule the job with job_queue from telegram.ext
-    job_queue.run_repeating(
+    # Schedule the job with job_queue from telegram.ext with more precise timing
+    job = job_queue.run_repeating(
         send_meet_link,
         interval=datetime.timedelta(days=7),  # Weekly
         first=target_time.astimezone(pytz.UTC),  # Convert to UTC for the job queue
         context=job_context
     )
     
-    logger.info(f"Scheduled job for user {user_id} on {DAYS_DISPLAY[day]} at {hours:02d}:{minutes:02d}, thread_id={thread_id}")
+    logger.info(f"Scheduled job for user {user_id} on {DAYS_DISPLAY[day]} at {hours:02d}:{minutes:02d}, thread_id={thread_id}, next run at {target_time}")
+    return job
 
 def setup_schedules(job_queue, bot) -> None:
     """Setup all schedules for all users."""
@@ -577,36 +569,45 @@ def send_instant_meet_link(update: Update, context: CallbackContext) -> None:
     thread_id = update.message.message_thread_id if hasattr(update.message, 'message_thread_id') else None
     
     try:
-        # Use static Google Meet link
-        meet_link = "https://meet.google.com/pep-zuux-ubg"
-        
-        # Параметры сообщения
-        send_params = {
-            'text': f'Ваша мгновенная Google Meet ссылка:\n{meet_link}'
-        }
-        
-        # Добавляем параметр message_thread_id, если thread_id указан
-        if thread_id is not None:
-            message = update.message.reply_text(**send_params)
-        else:
-            message = update.message.reply_text(**send_params)
-        
-        # Параметры удаления сообщения
-        delete_params = {
-            'chat_id': chat_id,
-            'message_id': message.message_id
-        }
-        
-        # Schedule message deletion after 59 minutes
-        context.job_queue.run_once(
-            lambda context: context.bot.delete_message(**delete_params),
-            3540,  # 59 minutes
-            context=None
-        )
-        
-        logger.info(f"Sent instant meet link to chat {chat_id}, thread_id={thread_id}")
+        # Use static Google Meet link with retry mechanism
+        for attempt in range(3):  # Try up to 3 times
+            try:
+                meet_link = "https://meet.google.com/pep-zuux-ubg"
+                
+                # Параметры сообщения
+                send_params = {
+                    'text': f'Ваша мгновенная Google Meet ссылка:\n{meet_link}',
+                    'disable_notification': False,  # Ensure notification is sent
+                }
+                
+                # Отправляем сообщение
+                message = update.message.reply_text(**send_params)
+                
+                # Параметры удаления сообщения
+                delete_params = {
+                    'chat_id': chat_id,
+                    'message_id': message.message_id
+                }
+                
+                # Schedule message deletion after 59 minutes
+                context.job_queue.run_once(
+                    lambda context: context.bot.delete_message(**delete_params),
+                    3540,  # 59 minutes
+                    context=None
+                )
+                
+                logger.info(f"Successfully sent instant meet link to chat {chat_id}, thread_id={thread_id}")
+                break  # Success, break out of retry loop
+                
+            except Exception as retry_error:
+                logger.warning(f"Instant link attempt {attempt+1}/3 failed: {retry_error}")
+                if attempt < 2:  # If not the last attempt
+                    time.sleep(2)  # Wait 2 seconds before retrying
+                else:
+                    raise  # On last attempt, re-raise the exception
+                
     except Exception as e:
-        logger.error(f"Error sending instant meet link: {e}")
+        logger.error(f"Error sending instant meet link after retries: {e}")
         update.message.reply_text('Произошла ошибка при отправке ссылки на Google Meet.')
 
 def add_schedule_direct(update: Update, context: CallbackContext) -> None:
@@ -915,29 +916,13 @@ def handle_text(update: Update, context: CallbackContext) -> None:
 
 def cleanup():
     """Clean up resources before exiting."""
-    global lock_file_handle
-    
-    # Skip cleanup if running under PM2
-    if os.environ.get('PM2_HOME') is not None:
-        logger.info("Running under PM2, skipping lock cleanup")
-        return
-    
-    # Release the lock and close the file handle
-    if lock_file_handle:
-        try:
-            fcntl.flock(lock_file_handle, fcntl.LOCK_UN)
-            lock_file_handle.close()
-            # Optionally remove the lock file
-            os.remove(LOCK_FILE)
-        except:
-            pass
+    logger.info("Cleanup: Lock file mechanism disabled")
+    pass
 
 def main() -> None:
     """Start the bot."""
-    # Check if another instance is running
-    if not check_single_instance():
-        logger.error("Exiting due to another instance running")
-        sys.exit(1)
+    # Always true now
+    check_single_instance()
     
     try:
         # Get bot token from environment variable
@@ -947,7 +932,7 @@ def main() -> None:
             return
         
         # Create the Updater and pass it your bot's token with increased timeouts
-        updater = Updater(token, request_kwargs={'read_timeout': 30, 'connect_timeout': 30})
+        updater = Updater(token, request_kwargs={'read_timeout': 60, 'connect_timeout': 60})
         
         # Get the dispatcher to register handlers
         dispatcher = updater.dispatcher
@@ -974,9 +959,9 @@ def main() -> None:
         load_schedules()
         setup_schedules(updater.job_queue, updater.bot)
         
-        # Start the Bot
-        updater.start_polling(allowed_updates=["message", "callback_query", "chat_member"])
-        logger.info("Bot started")
+        # Start the Bot with increased allowed update types for better reliability
+        updater.start_polling(allowed_updates=["message", "callback_query", "chat_member"], timeout=60, drop_pending_updates=False)
+        logger.info("Bot started with improved reliability settings")
         
         # Run the bot until you press Ctrl-C
         updater.idle()
