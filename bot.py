@@ -150,6 +150,9 @@ def process_schedule_add(update: Update, context: CallbackContext) -> int:
     user_id = update.effective_user.id
     state_key = f"{chat_id}_{user_id}"
     
+    # Получаем thread_id (ID темы), если сообщение из темы в супергруппе
+    thread_id = update.message.message_thread_id if hasattr(update.message, 'message_thread_id') else None
+    
     # Проверяем состояние пользователя
     if state_key not in user_states or user_states[state_key] != ADD_SCHEDULE:
         logger.info(f"Received message without valid state: {update.message.text} from {user_id} in chat {chat_id}")
@@ -192,12 +195,19 @@ def process_schedule_add(update: Update, context: CallbackContext) -> int:
                         del user_states[state_key]
                     return ConversationHandler.END
             
-            # Add new schedule
-            scheduled_meets[chat_id].append({
+            # Создаем запись расписания
+            schedule_entry = {
                 'day': day_of_week,
                 'hours': hours,
                 'minutes': minutes
-            })
+            }
+            
+            # Добавляем thread_id, если он есть
+            if thread_id is not None:
+                schedule_entry['thread_id'] = thread_id
+            
+            # Add new schedule
+            scheduled_meets[chat_id].append(schedule_entry)
             
             save_schedules()
             
@@ -209,7 +219,8 @@ def process_schedule_add(update: Update, context: CallbackContext) -> int:
                     chat_id,
                     day_of_week,
                     hours,
-                    minutes
+                    minutes,
+                    thread_id
                 )
         
         update.message.reply_text(
@@ -517,6 +528,8 @@ def setup_schedules(job_queue, bot) -> None:
     with schedule_lock:
         load_schedules()
         
+        logger.info(f"Setting up schedules from file: {scheduled_meets}")
+        
         for user_id, user_schedules in scheduled_meets.items():
             for schedule_item in user_schedules:
                 day = schedule_item['day']
@@ -534,6 +547,8 @@ def setup_schedules(job_queue, bot) -> None:
                     minutes,
                     thread_id
                 )
+        
+        logger.info("All schedules have been set up successfully")
 
 def help_command(update: Update, context: CallbackContext) -> None:
     """Send a message when the command /help is issued."""
@@ -630,63 +645,37 @@ def add_schedule_direct(update: Update, context: CallbackContext) -> None:
             update.message.reply_text('Произошла ошибка при проверке прав администратора.')
             return
     
-    # Получаем аргументы
-    text = update.message.text.strip()
-    
-    # Удаляем имя бота, если команда вызвана с @botname
-    if '@' in text:
-        text = text.split('@', 1)[0].strip()
-    
-    # Удаляем команду из текста
-    parts = text.split(' ', 1)
-    if len(parts) < 2:
+    # Проверяем, есть ли аргументы команды
+    if not context.args or len(context.args) < 2:
         update.message.reply_text(
-            'Пожалуйста, укажите день и время в формате: /addtime день ЧЧ:ММ\n'
+            'Пожалуйста, укажите день недели и время в формате:\n'
+            '/addtime день ЧЧ:ММ\n'
             'Например: /addtime среда 12:46'
         )
         return
     
-    # Разбираем аргументы (день и время)
-    arguments = parts[1].strip().lower()
-    
-    # Проверяем, есть ли в тексте день недели
-    day_found = False
-    for day in DAYS_RU.keys():
-        if day in arguments:
-            day_text = day
-            day_found = True
-            # Удаляем день из строки, чтобы проще было найти время
-            remaining_text = arguments.replace(day, "").strip()
-            break
-    
-    if not day_found:
-        update.message.reply_text(
-            f'Некорректный день недели. Используйте: {", ".join(DAYS_RU.keys())}\n'
-            'Например: /addtime среда 12:46'
-        )
-        return
-    
-    # Ищем время в формате ЧЧ:ММ в оставшемся тексте
-    import re
-    time_match = re.search(r'(\d{1,2}):(\d{2})', remaining_text)
-    if not time_match:
-        update.message.reply_text(
-            'Некорректный формат времени. Используйте ЧЧ:ММ, например 12:46\n'
-            'Например: /addtime среда 12:46'
-        )
-        return
-    
-    hours = int(time_match.group(1))
-    minutes = int(time_match.group(2))
-    
-    if not (0 <= hours < 24 and 0 <= minutes < 60):
-        update.message.reply_text('Некорректное время. Часы должны быть от 0 до 23, минуты от 0 до 59.')
-        return
-    
-    logger.info(f"Processing direct add: day={day_text}, time={hours}:{minutes:02d} from user {user_id} in chat {chat_id}, thread_id={thread_id}")
+    # Получаем день и время из аргументов
+    day_text = context.args[0].lower()
+    time_text = context.args[1]
     
     try:
+        # Проверяем день недели
+        if day_text not in DAYS_RU:
+            update.message.reply_text(
+                f'Некорректный день недели. Используйте: {", ".join(DAYS_RU.keys())}'
+            )
+            return
+        
         day_of_week = DAYS_RU[day_text]
+        
+        # Проверяем формат времени
+        try:
+            hours, minutes = map(int, time_text.split(':'))
+            if not (0 <= hours < 24 and 0 <= minutes < 60):
+                raise ValueError("Invalid time")
+        except:
+            update.message.reply_text('Некорректный формат времени. Используйте ЧЧ:ММ, например 12:46')
+            return
         
         with schedule_lock:
             load_schedules()
@@ -694,17 +683,14 @@ def add_schedule_direct(update: Update, context: CallbackContext) -> None:
             if chat_id not in scheduled_meets:
                 scheduled_meets[chat_id] = []
             
-            # Check if this schedule already exists
+            # Проверяем, существует ли уже такое расписание
             for schedule_item in scheduled_meets[chat_id]:
-                if (schedule_item['day'] == day_of_week and 
-                    schedule_item['hours'] == hours and 
-                    schedule_item['minutes'] == minutes and
-                    schedule_item.get('thread_id') == thread_id):
+                if schedule_item['day'] == day_of_week and schedule_item['hours'] == hours and schedule_item['minutes'] == minutes:
                     update.message.reply_text('Такое расписание уже существует!')
                     return
             
-            # Add new schedule with thread_id
-            new_schedule = {
+            # Создаем запись расписания
+            schedule_entry = {
                 'day': day_of_week,
                 'hours': hours,
                 'minutes': minutes
@@ -712,13 +698,14 @@ def add_schedule_direct(update: Update, context: CallbackContext) -> None:
             
             # Добавляем thread_id, если он есть
             if thread_id is not None:
-                new_schedule['thread_id'] = thread_id
-            
-            scheduled_meets[chat_id].append(new_schedule)
+                schedule_entry['thread_id'] = thread_id
+                
+            # Добавляем новое расписание
+            scheduled_meets[chat_id].append(schedule_entry)
             
             save_schedules()
             
-            # Schedule just this new task instead of rescheduling everything
+            # Создаем задание для нового расписания
             if hasattr(context, 'job_queue') and context.job_queue:
                 create_job_for_schedule(
                     context.bot,
@@ -734,11 +721,8 @@ def add_schedule_direct(update: Update, context: CallbackContext) -> None:
             f'Еженедельная отправка добавлена: {day_text} {hours:02d}:{minutes:02d}'
         )
     except Exception as e:
-        logger.error(f"Error in direct add schedule: {e}")
-        update.message.reply_text(
-            'Произошла ошибка. Убедитесь, что формат "/addtime день ЧЧ:ММ" правильный.\n'
-            'Например: /addtime среда 12:46'
-        )
+        logger.error(f"Error adding schedule directly: {e}")
+        update.message.reply_text('Произошла ошибка при добавлении расписания.')
 
 def delete_schedule_direct(update: Update, context: CallbackContext) -> None:
     """Directly delete a schedule without conversation (for groups)."""
@@ -958,6 +942,20 @@ def main() -> None:
         # Setup schedules using the job_queue from the updater
         load_schedules()
         setup_schedules(updater.job_queue, updater.bot)
+        
+        # Добавляем функцию для регулярной перезагрузки расписаний (раз в час)
+        def reload_schedules_job(context):
+            """Функция для периодической перезагрузки расписаний"""
+            logger.info("Performing periodic schedule reload")
+            try:
+                setup_schedules(context.job_queue, context.bot)
+                logger.info("Periodic schedule reload completed successfully")
+            except Exception as e:
+                logger.error(f"Error during periodic schedule reload: {e}")
+        
+        # Запускаем регулярное задание для перезагрузки расписаний каждый час
+        updater.job_queue.run_repeating(reload_schedules_job, interval=3600, first=300)
+        logger.info("Set up periodic schedule reload (every hour)")
         
         # Start the Bot with increased allowed update types for better reliability
         updater.start_polling(allowed_updates=["message", "callback_query", "chat_member"], timeout=60, drop_pending_updates=False)
