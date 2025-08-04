@@ -112,6 +112,7 @@ def setup_commands(updater):
         BotCommand("deletetime", "Удалить отправку в формате: /deletetime день ЧЧ:ММ"),
         BotCommand("meet", "Мгновенная встреча"),
         BotCommand("reminder", "Создать напоминание"),
+        BotCommand("addreminder", "Быстрое создание напоминания"),
         BotCommand("reminders", "Посмотреть напоминания"),
         BotCommand("deletereminder", "Удалить напоминание")
     ]
@@ -589,9 +590,14 @@ def help_command(update: Update, context: CallbackContext) -> None:
             '/list - просмотреть все отправки\n'
             '/deletetime день ЧЧ:ММ - удалить отправку\n\n'
             '⏰ Напоминания:\n'
-            '/reminder - создать напоминание\n'
+            '/addreminder ДД.ММ.ГГГГ ЧЧ:ММ периодичность текст - создать напоминание\n'
             '/reminders - просмотреть все напоминания\n'
             '/deletereminder - удалить напоминание\n\n'
+            '📝 Примеры создания напоминаний:\n'
+            '/addreminder 25.12.2024 15:30 однократно Поздравить с НГ\n'
+            '/addreminder 06.08.2024 09:00 ежедневно Утренняя планерка\n'
+            '/addreminder 12.08.2024 18:00 еженедельно Команда встреча\n\n'
+            '🔄 Периодичность: однократно, ежедневно, еженедельно, ежемесячно, ежегодно\n\n'
             '/start - начать работу с ботом\n'
             '/help - показать эту справку\n\n'
             'В группах управлять расписанием могут только администраторы.'
@@ -605,9 +611,13 @@ def help_command(update: Update, context: CallbackContext) -> None:
             '/list - просмотреть все отправки\n'
             '/delete - удалить отправку\n\n'
             '⏰ Напоминания:\n'
-            '/reminder - создать напоминание\n'
+            '/reminder - создать напоминание (пошаговый диалог)\n'
+            '/addreminder ДД.ММ.ГГГГ ЧЧ:ММ периодичность текст - быстрое создание\n'
             '/reminders - просмотреть все напоминания\n'
             '/deletereminder - удалить напоминание\n\n'
+            '📝 Примеры:\n'
+            '/addreminder 25.12.2024 15:30 однократно Поздравить с НГ\n'
+            '/addreminder 06.08.2024 09:00 ежедневно Утренняя зарядка\n\n'
             '/start - начать работу с ботом\n'
             '/help - показать эту справку'
         )
@@ -655,10 +665,16 @@ def process_reminder_time(update: Update, context: CallbackContext) -> int:
     user_id = update.effective_user.id
     state_key = f"{chat_id}_{user_id}"
     
+    logger.info(f"Processing reminder time from user {user_id} in chat {chat_id}")
+    logger.info(f"Current user states: {user_states}")
+    logger.info(f"Looking for state_key: {state_key}")
+    
     if state_key not in user_states or user_states[state_key] != ADD_REMINDER_TIME:
+        logger.warning(f"State key {state_key} not found or wrong state. Current state: {user_states.get(state_key, 'None')}")
         return ConversationHandler.END
     
     text = update.message.text.strip()
+    logger.info(f"Processing time text: '{text}'")
     
     try:
         # Парсим дату и время
@@ -1136,6 +1152,8 @@ def handle_text(update: Update, context: CallbackContext) -> None:
             return list_reminders(update, context)
         elif command == '/deletereminder':
             return delete_reminder_command(update, context)
+        elif command == '/addreminder':
+            return add_reminder_direct(update, context)
     
     # Если это не состояние диалога, обрабатываем команды
     if text.startswith('/add') or text == 'Добавить еженедельную отправку':
@@ -1148,16 +1166,20 @@ def handle_text(update: Update, context: CallbackContext) -> None:
         return send_instant_meet_link(update, context)
     elif text.startswith('/reminder') or text == 'Создать напоминание':
         return add_reminder_command(update, context)
+    elif text.startswith('/addreminder'):
+        return add_reminder_direct(update, context)
     elif text.startswith('/reminders') or text == 'Мои напоминания':
         return list_reminders(update, context)
     elif text.startswith('/deletereminder') or text == 'Удалить напоминание':
         return delete_reminder_command(update, context)
     else:
-        # Не отвечаем на случайные сообщения в группах
+        # Не отвечаем на случайные сообщения в группах (кроме случаев, когда пользователь в диалоге)
         if update.effective_chat.type in ['private']:
             update.message.reply_text(
                 'Используйте команды меню или /help для справки'
             )
+        # В группах игнорируем сообщения, которые не являются состояниями диалога
+        # (состояния диалога уже обработаны выше)
 
 def send_reminder(context: CallbackContext) -> None:
     """Send a reminder message."""
@@ -1295,6 +1317,163 @@ def list_reminders(update: Update, context: CallbackContext) -> None:
             
         message = "Ваши напоминания:\n\n" + "\n\n".join(reminders_list)
         update.message.reply_text(message)
+
+def add_reminder_direct(update: Update, context: CallbackContext) -> None:
+    """Directly add a reminder with all parameters in one command (for groups)."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Получаем thread_id (ID темы), если сообщение из темы в супергруппе
+    thread_id = update.message.message_thread_id if hasattr(update.message, 'message_thread_id') else None
+    
+    # Проверяем, является ли отправитель администратором группы, если это групповой чат
+    if update.effective_chat.type in ['group', 'supergroup']:
+        try:
+            member = context.bot.get_chat_member(chat_id, user_id)
+            if member.status not in ['creator', 'administrator']:
+                update.message.reply_text('Только администраторы группы могут создавать напоминания.')
+                return
+        except Exception as e:
+            logger.error(f"Error checking admin status: {e}")
+            update.message.reply_text('Произошла ошибка при проверке прав администратора.')
+            return
+    
+    # Получаем полный текст команды
+    full_text = update.message.text.strip()
+    
+    # Удаляем имя бота, если команда вызвана с @botname
+    if '@' in full_text:
+        # Находим первый пробел после @botname и удаляем только @botname
+        at_pos = full_text.find('@')
+        space_after_at = full_text.find(' ', at_pos)
+        if space_after_at != -1:
+            # Есть пробел после @botname - удаляем только @botname
+            command_part = full_text[:at_pos]
+            args_part = full_text[space_after_at:]
+            full_text = command_part + args_part
+        else:
+            # Нет пробела после @botname - только команда без аргументов
+            full_text = full_text.split('@', 1)[0].strip()
+    
+    # Разбираем команду
+    parts = full_text.split(' ', 1)
+    if len(parts) < 2:
+        update.message.reply_text(
+            'Используйте формат:\n'
+            '/addreminder ДД.ММ.ГГГГ ЧЧ:ММ периодичность текст напоминания\n\n'
+            'Например:\n'
+            '/addreminder 25.12.2024 15:30 однократно Поздравить с Новым годом\n'
+            '/addreminder 06.08.2024 09:00 ежедневно Утренняя планерка\n\n'
+            'Периодичность: однократно, ежедневно, еженедельно, ежемесячно, ежегодно'
+        )
+        return
+    
+    # Парсим аргументы
+    args_text = parts[1].strip()
+    args_parts = args_text.split(' ')
+    
+    if len(args_parts) < 4:
+        update.message.reply_text(
+            'Недостаточно параметров. Используйте формат:\n'
+            '/addreminder ДД.ММ.ГГГГ ЧЧ:ММ периодичность текст напоминания\n\n'
+            'Например:\n'
+            '/addreminder 25.12.2024 15:30 однократно Поздравить с Новым годом'
+        )
+        return
+    
+    date_str = args_parts[0]
+    time_str = args_parts[1]
+    frequency_str = args_parts[2].lower()
+    reminder_text = ' '.join(args_parts[3:])
+    
+    # Валидация периодичности
+    frequency_map = {
+        'однократно': 'once',
+        'ежедневно': 'daily',
+        'еженедельно': 'weekly',
+        'ежемесячно': 'monthly',
+        'ежегодно': 'yearly'
+    }
+    
+    if frequency_str not in frequency_map:
+        update.message.reply_text(
+            f'Неверная периодичность "{frequency_str}". Используйте:\n'
+            'однократно, ежедневно, еженедельно, ежемесячно, ежегодно\n\n'
+            'Например: /addreminder 25.12.2024 15:30 однократно Текст напоминания'
+        )
+        return
+    
+    frequency = frequency_map[frequency_str]
+    
+    try:
+        # Парсим дату и время
+        datetime_str = f"{date_str} {time_str}"
+        reminder_datetime = datetime.datetime.strptime(datetime_str, "%d.%m.%Y %H:%M")
+        reminder_datetime = MOSCOW_TZ.localize(reminder_datetime)
+        
+        # Проверяем, что время в будущем
+        now = datetime.datetime.now(MOSCOW_TZ)
+        if reminder_datetime <= now:
+            update.message.reply_text('Время напоминания должно быть в будущем.')
+            return
+        
+        # Создаем напоминание
+        with reminders_lock:
+            load_reminders()
+            
+            if chat_id not in reminders:
+                reminders[chat_id] = []
+            
+            # Генерируем уникальный ID
+            import uuid
+            reminder_id = str(uuid.uuid4())
+            
+            reminder = {
+                'id': reminder_id,
+                'datetime': reminder_datetime.isoformat(),
+                'frequency': frequency,
+                'text': reminder_text,
+                'thread_id': thread_id,
+                'created_at': datetime.datetime.now(MOSCOW_TZ).isoformat()
+            }
+            
+            reminders[chat_id].append(reminder)
+            save_reminders()
+            
+            # Планируем отправку напоминания
+            if hasattr(context, 'job_queue') and context.job_queue:
+                schedule_reminder(
+                    context.bot,
+                    context.job_queue,
+                    chat_id,
+                    reminder
+                )
+        
+        frequency_display = {
+            'once': 'однократно',
+            'daily': 'ежедневно',
+            'weekly': 'еженедельно',
+            'monthly': 'ежемесячно',
+            'yearly': 'ежегодно'
+        }.get(frequency, frequency)
+        
+        update.message.reply_text(
+            f'✅ Напоминание создано!\n'
+            f'📅 Время: {reminder_datetime.strftime("%d.%m.%Y %H:%M")} МСК\n'
+            f'🔄 Периодичность: {frequency_display}\n'
+            f'📝 Текст: {reminder_text}'
+        )
+        
+    except ValueError as e:
+        update.message.reply_text(
+            'Некорректный формат даты или времени.\n'
+            'Используйте формат: ДД.ММ.ГГГГ ЧЧ:ММ\n'
+            'Например: 25.12.2024 15:30'
+        )
+        logger.error(f"Date parsing error: {e}")
+    except Exception as e:
+        logger.error(f"Error creating reminder: {e}")
+        update.message.reply_text('Произошла ошибка при создании напоминания.')
 
 def delete_reminder_command(update: Update, context: CallbackContext) -> int:
     """Start the process of deleting a reminder."""
@@ -1459,6 +1638,7 @@ def main() -> None:
         
         # Команды для напоминаний
         dispatcher.add_handler(CommandHandler("reminder", add_reminder_command))
+        dispatcher.add_handler(CommandHandler("addreminder", add_reminder_direct))
         dispatcher.add_handler(CommandHandler("reminders", list_reminders))
         dispatcher.add_handler(CommandHandler("deletereminder", delete_reminder_command))
         
