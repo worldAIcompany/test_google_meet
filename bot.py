@@ -10,7 +10,7 @@ import threading
 import schedule
 import pytz
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, BotCommand
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, BotCommand
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
 from google_meet.google_meet import google_meet
 
@@ -28,12 +28,17 @@ def check_single_instance():
     return True
 
 # Conversation states
-ADD_SCHEDULE, DELETE_SCHEDULE = range(2)
+ADD_SCHEDULE, DELETE_SCHEDULE, ADD_REMINDER_TIME, ADD_REMINDER_FREQUENCY, ADD_REMINDER_TEXT, DELETE_REMINDER = range(6)
 
 # Storage for scheduled tasks
 SCHEDULE_FILE = 'scheduled_meets.json'
 scheduled_meets = {}
 schedule_lock = threading.Lock()
+
+# Storage for reminders
+REMINDERS_FILE = 'reminders.json'
+reminders = {}
+reminders_lock = threading.Lock()
 
 # Moscow timezone
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -62,6 +67,8 @@ DAYS_DISPLAY = {
 
 # Используем dict для отслеживания состояний в разных чатах
 user_states = {}
+# Временное хранилище для создаваемых напоминаний
+temp_reminders = {}
 
 def load_schedules():
     """Load schedules from file."""
@@ -78,6 +85,21 @@ def save_schedules():
     with open(SCHEDULE_FILE, 'w') as f:
         json.dump(scheduled_meets, f)
 
+def load_reminders():
+    """Load reminders from file."""
+    global reminders
+    if os.path.exists(REMINDERS_FILE):
+        with open(REMINDERS_FILE, 'r') as f:
+            data = json.load(f)
+            reminders = {int(k): v for k, v in data.items()}
+    else:
+        reminders = {}
+
+def save_reminders():
+    """Save reminders to file."""
+    with open(REMINDERS_FILE, 'w') as f:
+        json.dump(reminders, f)
+
 def setup_commands(updater):
     """Set up bot commands in menu"""
     commands = [
@@ -88,7 +110,10 @@ def setup_commands(updater):
         BotCommand("list", "Посмотреть отправки"),
         BotCommand("delete", "Удалить отправку"),
         BotCommand("deletetime", "Удалить отправку в формате: /deletetime день ЧЧ:ММ"),
-        BotCommand("meet", "Мгновенная встреча")
+        BotCommand("meet", "Мгновенная встреча"),
+        BotCommand("reminder", "Создать напоминание"),
+        BotCommand("reminders", "Посмотреть напоминания"),
+        BotCommand("deletereminder", "Удалить напоминание")
     ]
     updater.bot.set_my_commands(commands)
     logger.info("Bot commands have been set up")
@@ -101,13 +126,14 @@ def start(update: Update, context: CallbackContext) -> None:
     keyboard = [
         ['/add', '/list'],
         ['/delete', '/meet'],
+        ['/reminder', '/reminders'],
         ['/help']
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     update.message.reply_text(
-        f'Привет, {user.first_name}! Я бот для создания и отправки ссылок на Google Meet.\n\n'
-        'Используйте команды ниже для управления автоматическими отправками.',
+        f'Привет, {user.first_name}! Я бот для создания и отправки ссылок на Google Meet и напоминаний.\n\n'
+        'Используйте команды ниже для управления.',
         reply_markup=reply_markup
     )
     
@@ -556,25 +582,240 @@ def help_command(update: Update, context: CallbackContext) -> None:
     
     if is_group:
         update.message.reply_text(
-            'Команды бота в группах:\n'
-            '/start - начать работу с ботом\n'
-            '/help - показать эту справку\n'
-            '/addtime день ЧЧ:ММ - добавить еженедельную отправку (например: /addtime среда 12:46)\n'
+            'Команды бота в группах:\n\n'
+            '📅 Google Meet:\n'
+            '/meet - получить мгновенную ссылку на встречу\n'
+            '/addtime день ЧЧ:ММ - добавить еженедельную отправку\n'
             '/list - просмотреть все отправки\n'
-            '/deletetime день ЧЧ:ММ - удалить отправку (например: /deletetime среда 12:46)\n'
-            '/meet - получить мгновенную ссылку на встречу\n\n'
+            '/deletetime день ЧЧ:ММ - удалить отправку\n\n'
+            '⏰ Напоминания:\n'
+            '/reminder - создать напоминание\n'
+            '/reminders - просмотреть все напоминания\n'
+            '/deletereminder - удалить напоминание\n\n'
+            '/start - начать работу с ботом\n'
+            '/help - показать эту справку\n\n'
             'В группах управлять расписанием могут только администраторы.'
         )
     else:
         update.message.reply_text(
-            'Команды бота:\n'
-            '/start - начать работу с ботом\n'
-            '/help - показать эту справку\n'
+            'Команды бота:\n\n'
+            '📅 Google Meet:\n'
+            '/meet - получить мгновенную ссылку на встречу\n'
             '/add - добавить еженедельную отправку\n'
             '/list - просмотреть все отправки\n'
-            '/delete - удалить отправку\n'
-            '/meet - получить мгновенную ссылку на встречу'
+            '/delete - удалить отправку\n\n'
+            '⏰ Напоминания:\n'
+            '/reminder - создать напоминание\n'
+            '/reminders - просмотреть все напоминания\n'
+            '/deletereminder - удалить напоминание\n\n'
+            '/start - начать работу с ботом\n'
+            '/help - показать эту справку'
         )
+
+def add_reminder_command(update: Update, context: CallbackContext) -> int:
+    """Start the process of adding a new reminder."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Сохраняем состояние пользователя/чата
+    state_key = f"{chat_id}_{user_id}"
+    user_states[state_key] = ADD_REMINDER_TIME
+    
+    # Инициализируем временное хранилище для напоминания
+    temp_reminders[state_key] = {
+        'chat_id': chat_id,
+        'thread_id': update.message.message_thread_id if hasattr(update.message, 'message_thread_id') else None
+    }
+    
+    # Проверяем права администратора в группах
+    if update.effective_chat.type in ['group', 'supergroup']:
+        try:
+            member = context.bot.get_chat_member(chat_id, user_id)
+            if member.status not in ['creator', 'administrator']:
+                update.message.reply_text('Только администраторы группы могут создавать напоминания.')
+                if state_key in user_states:
+                    del user_states[state_key]
+                if state_key in temp_reminders:
+                    del temp_reminders[state_key]
+                return ConversationHandler.END
+        except Exception as e:
+            logger.error(f"Error checking admin status: {e}")
+            update.message.reply_text('Произошла ошибка при проверке прав администратора.')
+            return ConversationHandler.END
+    
+    update.message.reply_text(
+        'Укажите время напоминания по Москве в формате "ДД.ММ.ГГГГ ЧЧ:ММ"\n'
+        'Например: 25.12.2024 15:30'
+    )
+    return ADD_REMINDER_TIME
+
+def process_reminder_time(update: Update, context: CallbackContext) -> int:
+    """Process reminder time input."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    state_key = f"{chat_id}_{user_id}"
+    
+    if state_key not in user_states or user_states[state_key] != ADD_REMINDER_TIME:
+        return ConversationHandler.END
+    
+    text = update.message.text.strip()
+    
+    try:
+        # Парсим дату и время
+        reminder_datetime = datetime.datetime.strptime(text, "%d.%m.%Y %H:%M")
+        reminder_datetime = MOSCOW_TZ.localize(reminder_datetime)
+        
+        # Проверяем, что время в будущем
+        now = datetime.datetime.now(MOSCOW_TZ)
+        if reminder_datetime <= now:
+            update.message.reply_text('Время напоминания должно быть в будущем. Попробуйте снова.')
+            return ADD_REMINDER_TIME
+        
+        # Сохраняем время
+        temp_reminders[state_key]['datetime'] = reminder_datetime
+        
+        # Переходим к выбору периодичности
+        user_states[state_key] = ADD_REMINDER_FREQUENCY
+        
+        keyboard = [
+            ['Однократно', 'Каждый день'],
+            ['Каждую неделю', 'Каждый месяц'],
+            ['Каждый год']
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        
+        update.message.reply_text(
+            'Выберите периодичность напоминания:',
+            reply_markup=reply_markup
+        )
+        return ADD_REMINDER_FREQUENCY
+        
+    except ValueError:
+        update.message.reply_text(
+            'Некорректный формат даты и времени.\n'
+            'Используйте формат "ДД.ММ.ГГГГ ЧЧ:ММ"\n'
+            'Например: 25.12.2024 15:30'
+        )
+        return ADD_REMINDER_TIME
+
+def process_reminder_frequency(update: Update, context: CallbackContext) -> int:
+    """Process reminder frequency selection."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    state_key = f"{chat_id}_{user_id}"
+    
+    if state_key not in user_states or user_states[state_key] != ADD_REMINDER_FREQUENCY:
+        return ConversationHandler.END
+    
+    text = update.message.text.strip()
+    
+    frequency_map = {
+        'Однократно': 'once',
+        'Каждый день': 'daily',
+        'Каждую неделю': 'weekly',
+        'Каждый месяц': 'monthly',
+        'Каждый год': 'yearly'
+    }
+    
+    if text not in frequency_map:
+        update.message.reply_text('Пожалуйста, выберите один из предложенных вариантов.')
+        return ADD_REMINDER_FREQUENCY
+    
+    # Сохраняем периодичность
+    temp_reminders[state_key]['frequency'] = frequency_map[text]
+    
+    # Переходим к вводу текста напоминания
+    user_states[state_key] = ADD_REMINDER_TEXT
+    
+    update.message.reply_text(
+        'Введите текст напоминания:',
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return ADD_REMINDER_TEXT
+
+def process_reminder_text(update: Update, context: CallbackContext) -> int:
+    """Process reminder text and save the reminder."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    state_key = f"{chat_id}_{user_id}"
+    
+    if state_key not in user_states or user_states[state_key] != ADD_REMINDER_TEXT:
+        return ConversationHandler.END
+    
+    text = update.message.text.strip()
+    
+    if not text:
+        update.message.reply_text('Текст напоминания не может быть пустым. Попробуйте снова.')
+        return ADD_REMINDER_TEXT
+    
+    # Сохраняем текст
+    temp_reminders[state_key]['text'] = text
+    
+    # Создаем напоминание
+    with reminders_lock:
+        load_reminders()
+        
+        if chat_id not in reminders:
+            reminders[chat_id] = []
+        
+        # Генерируем уникальный ID
+        import uuid
+        reminder_id = str(uuid.uuid4())
+        
+        reminder = {
+            'id': reminder_id,
+            'datetime': temp_reminders[state_key]['datetime'].isoformat(),
+            'frequency': temp_reminders[state_key]['frequency'],
+            'text': temp_reminders[state_key]['text'],
+            'thread_id': temp_reminders[state_key].get('thread_id'),
+            'created_at': datetime.datetime.now(MOSCOW_TZ).isoformat()
+        }
+        
+        reminders[chat_id].append(reminder)
+        save_reminders()
+        
+        # Планируем отправку напоминания
+        if hasattr(context, 'job_queue') and context.job_queue:
+            schedule_reminder(
+                context.bot,
+                context.job_queue,
+                chat_id,
+                reminder
+            )
+    
+    # Показываем клавиатуру по умолчанию
+    keyboard = [
+        ['/add', '/list'],
+        ['/delete', '/meet'],
+        ['/reminder', '/reminders'],
+        ['/help']
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    # Формируем сообщение об успехе до удаления временных данных
+    datetime_str = temp_reminders[state_key]["datetime"].strftime("%d.%m.%Y %H:%M")
+    frequency_str = {
+        'once': 'Однократно',
+        'daily': 'Каждый день',
+        'weekly': 'Каждую неделю',
+        'monthly': 'Каждый месяц',
+        'yearly': 'Каждый год'
+    }.get(temp_reminders[state_key]['frequency'], 'Неизвестно')
+    
+    # Очищаем временные данные и состояние
+    if state_key in user_states:
+        del user_states[state_key]
+    if state_key in temp_reminders:
+        del temp_reminders[state_key]
+    
+    update.message.reply_text(
+        f'Напоминание создано!\n'
+        f'Время: {datetime_str} МСК\n'
+        f'Периодичность: {frequency_str}',
+        reply_markup=reply_markup
+    )
+    
+    return ConversationHandler.END
 
 def send_instant_meet_link(update: Update, context: CallbackContext) -> None:
     """Send an instant Google Meet link to the user."""
@@ -868,6 +1109,14 @@ def handle_text(update: Update, context: CallbackContext) -> None:
             return process_schedule_add(update, context)
         elif state == DELETE_SCHEDULE:
             return process_schedule_delete(update, context)
+        elif state == ADD_REMINDER_TIME:
+            return process_reminder_time(update, context)
+        elif state == ADD_REMINDER_FREQUENCY:
+            return process_reminder_frequency(update, context)
+        elif state == ADD_REMINDER_TEXT:
+            return process_reminder_text(update, context)
+        elif state == DELETE_REMINDER:
+            return process_reminder_delete(update, context)
     
     # Обработка команд с @username в группах
     if '@' in text:
@@ -881,6 +1130,12 @@ def handle_text(update: Update, context: CallbackContext) -> None:
             return delete_schedule_command(update, context)
         elif command == '/meet':
             return send_instant_meet_link(update, context)
+        elif command == '/reminder':
+            return add_reminder_command(update, context)
+        elif command == '/reminders':
+            return list_reminders(update, context)
+        elif command == '/deletereminder':
+            return delete_reminder_command(update, context)
     
     # Если это не состояние диалога, обрабатываем команды
     if text.startswith('/add') or text == 'Добавить еженедельную отправку':
@@ -891,12 +1146,281 @@ def handle_text(update: Update, context: CallbackContext) -> None:
         return delete_schedule_command(update, context)
     elif text.startswith('/meet') or text == 'Мгновенная встреча':
         return send_instant_meet_link(update, context)
+    elif text.startswith('/reminder') or text == 'Создать напоминание':
+        return add_reminder_command(update, context)
+    elif text.startswith('/reminders') or text == 'Мои напоминания':
+        return list_reminders(update, context)
+    elif text.startswith('/deletereminder') or text == 'Удалить напоминание':
+        return delete_reminder_command(update, context)
     else:
         # Не отвечаем на случайные сообщения в группах
         if update.effective_chat.type in ['private']:
             update.message.reply_text(
                 'Используйте команды меню или /help для справки'
             )
+
+def send_reminder(context: CallbackContext) -> None:
+    """Send a reminder message."""
+    job = context.job
+    chat_id = job.context['chat_id']
+    reminder = job.context['reminder']
+    
+    try:
+        # Параметры сообщения
+        send_params = {
+            'chat_id': chat_id,
+            'text': f'⏰ Напоминание:\n\n{reminder["text"]}',
+            'disable_notification': False,
+        }
+        
+        # Добавляем параметр message_thread_id, если thread_id указан
+        if reminder.get('thread_id') is not None:
+            send_params['message_thread_id'] = reminder['thread_id']
+        
+        # Отправляем сообщение
+        context.bot.send_message(**send_params)
+        
+        logger.info(f"Successfully sent reminder to chat {chat_id}")
+        
+        # Если напоминание однократное, удаляем его из списка
+        if reminder['frequency'] == 'once':
+            with reminders_lock:
+                load_reminders()
+                if chat_id in reminders:
+                    reminders[chat_id] = [r for r in reminders[chat_id] if r['id'] != reminder['id']]
+                    save_reminders()
+                    
+    except Exception as e:
+        logger.error(f"Error sending reminder: {e}")
+
+def schedule_reminder(bot, job_queue, chat_id, reminder):
+    """Schedule a reminder based on its frequency."""
+    try:
+        # Парсим время напоминания
+        reminder_datetime = datetime.datetime.fromisoformat(reminder['datetime'])
+        
+        # Контекст для задания
+        job_context = {
+            'chat_id': chat_id,
+            'reminder': reminder
+        }
+        
+        # Планируем напоминание в зависимости от периодичности
+        if reminder['frequency'] == 'once':
+            # Однократное напоминание
+            job_queue.run_once(
+                send_reminder,
+                when=reminder_datetime.astimezone(pytz.UTC),
+                context=job_context
+            )
+            logger.info(f"Scheduled one-time reminder for chat {chat_id} at {reminder_datetime}")
+            
+        elif reminder['frequency'] == 'daily':
+            # Ежедневное напоминание
+            job_queue.run_daily(
+                send_reminder,
+                time=reminder_datetime.time(),
+                context=job_context
+            )
+            logger.info(f"Scheduled daily reminder for chat {chat_id} at {reminder_datetime.time()}")
+            
+        elif reminder['frequency'] == 'weekly':
+            # Еженедельное напоминание
+            job_queue.run_repeating(
+                send_reminder,
+                interval=datetime.timedelta(days=7),
+                first=reminder_datetime.astimezone(pytz.UTC),
+                context=job_context
+            )
+            logger.info(f"Scheduled weekly reminder for chat {chat_id} starting {reminder_datetime}")
+            
+        elif reminder['frequency'] == 'monthly':
+            # Ежемесячное напоминание - используем run_repeating с интервалом 30 дней
+            job_queue.run_repeating(
+                send_reminder,
+                interval=datetime.timedelta(days=30),
+                first=reminder_datetime.astimezone(pytz.UTC),
+                context=job_context
+            )
+            logger.info(f"Scheduled monthly reminder for chat {chat_id} starting {reminder_datetime}")
+            
+        elif reminder['frequency'] == 'yearly':
+            # Ежегодное напоминание
+            job_queue.run_repeating(
+                send_reminder,
+                interval=datetime.timedelta(days=365),
+                first=reminder_datetime.astimezone(pytz.UTC),
+                context=job_context
+            )
+            logger.info(f"Scheduled yearly reminder for chat {chat_id} starting {reminder_datetime}")
+            
+    except Exception as e:
+        logger.error(f"Error scheduling reminder: {e}")
+
+def list_reminders(update: Update, context: CallbackContext) -> None:
+    """Show all reminders for the chat."""
+    chat_id = update.effective_chat.id
+    thread_id = update.message.message_thread_id if hasattr(update.message, 'message_thread_id') else None
+    
+    with reminders_lock:
+        load_reminders()
+        
+        if chat_id not in reminders or not reminders[chat_id]:
+            update.message.reply_text('У вас нет активных напоминаний.')
+            return
+        
+        reminders_list = []
+        for idx, reminder in enumerate(reminders[chat_id], 1):
+            # Если сообщение из темы, показываем только напоминания для этой темы
+            if thread_id is not None and reminder.get('thread_id') != thread_id:
+                continue
+                
+            dt = datetime.datetime.fromisoformat(reminder['datetime'])
+            frequency_str = {
+                'once': 'однократно',
+                'daily': 'ежедневно',
+                'weekly': 'еженедельно',
+                'monthly': 'ежемесячно',
+                'yearly': 'ежегодно'
+            }.get(reminder['frequency'], 'неизвестно')
+            
+            reminders_list.append(
+                f"{idx}. {dt.strftime('%d.%m.%Y %H:%M')} ({frequency_str})\n"
+                f"   Текст: {reminder['text'][:50]}{'...' if len(reminder['text']) > 50 else ''}"
+            )
+        
+        if not reminders_list and thread_id is not None:
+            update.message.reply_text('В этой теме нет активных напоминаний.')
+            return
+            
+        message = "Ваши напоминания:\n\n" + "\n\n".join(reminders_list)
+        update.message.reply_text(message)
+
+def delete_reminder_command(update: Update, context: CallbackContext) -> int:
+    """Start the process of deleting a reminder."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Проверяем права администратора в группах
+    if update.effective_chat.type in ['group', 'supergroup']:
+        try:
+            member = context.bot.get_chat_member(chat_id, user_id)
+            if member.status not in ['creator', 'administrator']:
+                update.message.reply_text('Только администраторы группы могут удалять напоминания.')
+                return ConversationHandler.END
+        except Exception as e:
+            logger.error(f"Error checking admin status: {e}")
+            update.message.reply_text('Произошла ошибка при проверке прав администратора.')
+            return ConversationHandler.END
+    
+    with reminders_lock:
+        load_reminders()
+        
+        if chat_id not in reminders or not reminders[chat_id]:
+            update.message.reply_text('У вас нет активных напоминаний.')
+            return ConversationHandler.END
+    
+    # Сохраняем состояние
+    state_key = f"{chat_id}_{user_id}"
+    user_states[state_key] = DELETE_REMINDER
+    
+    # Показываем список напоминаний с номерами
+    thread_id = update.message.message_thread_id if hasattr(update.message, 'message_thread_id') else None
+    
+    reminders_list = []
+    valid_indices = []
+    
+    for idx, reminder in enumerate(reminders[chat_id], 1):
+        # Если сообщение из темы, показываем только напоминания для этой темы
+        if thread_id is not None and reminder.get('thread_id') != thread_id:
+            continue
+            
+        dt = datetime.datetime.fromisoformat(reminder['datetime'])
+        frequency_str = {
+            'once': 'однократно',
+            'daily': 'ежедневно',
+            'weekly': 'еженедельно',
+            'monthly': 'ежемесячно',
+            'yearly': 'ежегодно'
+        }.get(reminder['frequency'], 'неизвестно')
+        
+        reminders_list.append(
+            f"{idx}. {dt.strftime('%d.%m.%Y %H:%M')} ({frequency_str})\n"
+            f"   Текст: {reminder['text'][:50]}{'...' if len(reminder['text']) > 50 else ''}"
+        )
+        valid_indices.append(idx)
+    
+    if not reminders_list:
+        update.message.reply_text('В этой теме нет активных напоминаний.')
+        if state_key in user_states:
+            del user_states[state_key]
+        return ConversationHandler.END
+    
+    # Сохраняем валидные индексы для этого пользователя
+    temp_reminders[state_key] = {'valid_indices': valid_indices, 'thread_id': thread_id}
+    
+    message = "Выберите номер напоминания для удаления:\n\n" + "\n\n".join(reminders_list)
+    update.message.reply_text(message)
+    
+    return DELETE_REMINDER
+
+def process_reminder_delete(update: Update, context: CallbackContext) -> int:
+    """Process reminder deletion."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    state_key = f"{chat_id}_{user_id}"
+    
+    if state_key not in user_states or user_states[state_key] != DELETE_REMINDER:
+        return ConversationHandler.END
+    
+    text = update.message.text.strip()
+    
+    try:
+        reminder_num = int(text)
+        
+        if state_key not in temp_reminders or reminder_num not in temp_reminders[state_key]['valid_indices']:
+            update.message.reply_text('Некорректный номер напоминания. Попробуйте снова или /cancel для отмены.')
+            return DELETE_REMINDER
+        
+        with reminders_lock:
+            load_reminders()
+            
+            if chat_id in reminders and 0 < reminder_num <= len(reminders[chat_id]):
+                # Удаляем напоминание
+                deleted_reminder = reminders[chat_id].pop(reminder_num - 1)
+                save_reminders()
+                
+                # Отменяем задание в планировщике
+                # TODO: Реализовать отмену задания в job_queue
+                
+                update.message.reply_text('Напоминание успешно удалено.')
+            else:
+                update.message.reply_text('Ошибка при удалении напоминания.')
+        
+    except ValueError:
+        update.message.reply_text('Пожалуйста, введите номер напоминания.')
+        return DELETE_REMINDER
+    
+    # Очищаем состояние
+    if state_key in user_states:
+        del user_states[state_key]
+    if state_key in temp_reminders:
+        del temp_reminders[state_key]
+    
+    return ConversationHandler.END
+
+def setup_reminders(job_queue, bot):
+    """Setup all reminders for all chats."""
+    with reminders_lock:
+        load_reminders()
+        
+        logger.info(f"Setting up reminders from file: {reminders}")
+        
+        for chat_id, chat_reminders in reminders.items():
+            for reminder in chat_reminders:
+                schedule_reminder(bot, job_queue, int(chat_id), reminder)
+        
+        logger.info("All reminders have been set up successfully")
 
 def cleanup():
     """Clean up resources before exiting."""
