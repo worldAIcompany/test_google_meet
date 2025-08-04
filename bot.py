@@ -1457,6 +1457,11 @@ def main() -> None:
         dispatcher.add_handler(CommandHandler("addtime", add_schedule_direct))
         dispatcher.add_handler(CommandHandler("deletetime", delete_schedule_direct))
         
+        # Команды для напоминаний
+        dispatcher.add_handler(CommandHandler("reminder", add_reminder_command))
+        dispatcher.add_handler(CommandHandler("reminders", list_reminders))
+        dispatcher.add_handler(CommandHandler("deletereminder", delete_reminder_command))
+        
         # Обработка текстовых сообщений
         dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
         
@@ -1467,19 +1472,24 @@ def main() -> None:
         load_schedules()
         setup_schedules(updater.job_queue, updater.bot)
         
-        # Добавляем функцию для регулярной перезагрузки расписаний (раз в час)
+        # Setup reminders using the job_queue from the updater
+        load_reminders()
+        setup_reminders(updater.job_queue, updater.bot)
+        
+        # Добавляем функцию для регулярной перезагрузки расписаний и напоминаний (раз в час)
         def reload_schedules_job(context):
-            """Функция для периодической перезагрузки расписаний"""
-            logger.info("Performing periodic schedule reload")
+            """Функция для периодической перезагрузки расписаний и напоминаний"""
+            logger.info("Performing periodic schedule and reminders reload")
             try:
                 setup_schedules(context.job_queue, context.bot)
-                logger.info("Periodic schedule reload completed successfully")
+                setup_reminders(context.job_queue, context.bot)
+                logger.info("Periodic schedule and reminders reload completed successfully")
             except Exception as e:
-                logger.error(f"Error during periodic schedule reload: {e}")
+                logger.error(f"Error during periodic schedule and reminders reload: {e}")
         
-        # Запускаем регулярное задание для перезагрузки расписаний каждый час
+        # Запускаем регулярное задание для перезагрузки расписаний и напоминаний каждый час
         updater.job_queue.run_repeating(reload_schedules_job, interval=3600, first=300)
-        logger.info("Set up periodic schedule reload (every hour)")
+        logger.info("Set up periodic schedule and reminders reload (every hour)")
         
         # Start the Bot with increased allowed update types for better reliability
         updater.start_polling(allowed_updates=["message", "callback_query", "chat_member"], timeout=60, drop_pending_updates=False)
